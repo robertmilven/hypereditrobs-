@@ -56,6 +56,7 @@ export default function Home() {
     addClip,
     updateClip,
     deleteClip,
+    undoWorkflowClips,
     moveClip,
     splitClip,
     saveProject,
@@ -67,7 +68,9 @@ export default function Home() {
     addCaptionClipsBatch,
     clearCaptionClips,
     updateCaptionStyle,
+    updateCaptionWords,
     getCaptionData,
+    captionData,
     // Timeline tabs
     timelineTabs,
     activeTabId,
@@ -449,6 +452,14 @@ export default function Home() {
     }
   }, [deleteClip, selectedClipId, autoSnap, activeTabId, timelineTabs, updateTabClips]);
 
+  // Delete all caption clips on T1 and immediately persist the change.
+  // Uses explicit clips array to avoid stale clipsRef — setClips hasn't committed to ref yet.
+  const handleClearAllCaptionClips = useCallback(() => {
+    const newClips = clips.filter(c => c.trackId !== 'T1');
+    clearCaptionClips();
+    saveProjectNow(newClips);
+  }, [clips, clearCaptionClips, saveProjectNow]);
+
   // Handle cutting clips at the playhead position
   const handleCutAtPlayhead = useCallback(() => {
     // Find all clips that are under the playhead
@@ -642,9 +653,29 @@ export default function Home() {
 
     console.log('Generating chapters and making cuts...');
 
+    // Build pre-built transcript from existing captionData if available (skips Whisper on server)
+    let preBuiltTranscript: string | null = null;
+    const t1Clips = clips.filter(c => c.trackId === 'T1').sort((a, b) => a.start - b.start);
+    if (t1Clips.length > 0 && Object.keys(captionData).length > 0) {
+      const parts: string[] = [];
+      for (const clip of t1Clips) {
+        const cd = captionData[clip.id];
+        if (!cd?.words?.length) continue;
+        for (const word of cd.words) {
+          parts.push(`[${(clip.start + word.start).toFixed(1)}s] ${word.text}`);
+        }
+      }
+      if (parts.length > 10) {
+        preBuiltTranscript = parts.join(' ');
+        console.log(`Smart chapters: using ${parts.length} caption words instead of re-transcribing`);
+      }
+    }
+
     // Generate chapters using the session API
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/chapters`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(preBuiltTranscript ? { transcript: preBuiltTranscript } : {}),
     });
 
     if (!response.ok) {
@@ -742,6 +773,213 @@ export default function Home() {
       cutsApplied,
       youtubeFormat: result.youtubeFormat || '',
     };
+  }, [session, clips, captionData, loadProject]);
+
+  // Handle scene detection — returns timestamps of scene changes
+  const handleSceneDetect = useCallback(async (): Promise<{ scenes: Array<{ timestamp: number }> }> => {
+    if (!session) throw new Error('No session available');
+    const v1Clip = clips.find(c => c.trackId === 'V1');
+    if (!v1Clip) throw new Error('No video on V1 track. Please add a video to the timeline first.');
+
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'scene-detect' }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Scene detection failed');
+    }
+
+    const data = await response.json();
+    return { scenes: data.scenes || [] };
+  }, [session, clips]);
+
+  // Apply scene cuts — splits V1 clip at each scene timestamp
+  const handleApplySceneCuts = useCallback(async (timestamps: number[]): Promise<{ cutsApplied: number }> => {
+    if (!session) throw new Error('No session available');
+
+    const sortedTimestamps = [...timestamps].sort((a, b) => a - b);
+
+    const projectResponse = await fetch(`http://localhost:3333/session/${session.sessionId}/project`);
+    const projectData = await projectResponse.json();
+    let currentClips: TimelineClip[] = projectData.clips || [];
+
+    let cutsApplied = 0;
+    for (const timestamp of sortedTimestamps) {
+      const clipIndex = currentClips.findIndex((clip: TimelineClip) =>
+        clip.trackId === 'V1' &&
+        timestamp > clip.start &&
+        timestamp < clip.start + clip.duration
+      );
+      if (clipIndex === -1) continue;
+
+      const clip = currentClips[clipIndex];
+      const timeInClip = timestamp - clip.start;
+      if (timeInClip <= 0.05 || timeInClip >= clip.duration - 0.05) continue;
+
+      const splitInPoint = clip.inPoint + timeInClip;
+      const secondClip: TimelineClip = {
+        id: crypto.randomUUID(),
+        assetId: clip.assetId,
+        trackId: clip.trackId,
+        start: timestamp,
+        duration: clip.duration - timeInClip,
+        inPoint: splitInPoint,
+        outPoint: clip.outPoint,
+        transform: clip.transform ? { ...clip.transform } : undefined,
+      };
+      currentClips[clipIndex] = { ...clip, duration: timeInClip, outPoint: splitInPoint };
+      currentClips.push(secondClip);
+      cutsApplied++;
+    }
+
+    if (cutsApplied > 0) {
+      await fetch(`http://localhost:3333/session/${session.sessionId}/project`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...projectData, clips: currentClips }),
+      });
+      await loadProject();
+    }
+
+    return { cutsApplied };
+  }, [session, clips, loadProject]);
+
+  // Mute filler words in the V1 video using caption word timestamps
+  const handleMuteFillerWords = useCallback(async (fillerWords: Set<string>): Promise<{ mutedCount: number }> => {
+    if (!session) throw new Error('No session available');
+
+    const v1Clip = clips.find(c => c.trackId === 'V1');
+    if (!v1Clip) throw new Error('No video on V1 track.');
+
+    // Gather filler word time segments from captionData with small padding
+    const PAD = 0.05;
+    const segments: Array<{ start: number; end: number }> = [];
+    const t1Clips = clips.filter(c => c.trackId === 'T1').sort((a, b) => a.start - b.start);
+    for (const clip of t1Clips) {
+      const cd = captionData[clip.id];
+      if (!cd?.words?.length) continue;
+      for (const word of cd.words) {
+        if (fillerWords.has(word.text.toLowerCase().replace(/[^a-z\-]/g, ''))) {
+          // Timestamps in captionData are relative to clip start; convert to absolute
+          segments.push({
+            start: Math.max(0, clip.start + word.start - PAD),
+            end: clip.start + word.end + PAD,
+          });
+        }
+      }
+    }
+
+    if (segments.length === 0) throw new Error('No filler words found in caption data.');
+
+    const videoAsset = assets.find(a => a.id === v1Clip.assetId);
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'mute-segments', segments, assetId: videoAsset?.id }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Mute segments failed');
+    }
+
+    await refreshAssets();
+    return { mutedCount: segments.length };
+  }, [session, clips, captionData, assets, refreshAssets]);
+
+  // Resequence sections via Gemini + caption transcript
+  const handleResequence = useCallback(async (instruction: string): Promise<{
+    swaps: Array<{ from: { startTime: number; endTime: number; label: string }; to: { startTime: number; endTime: number; label: string } }>;
+    explanation: string;
+  }> => {
+    if (!session) throw new Error('No session available');
+
+    // Build transcript from captionData
+    const t1Clips = clips.filter(c => c.trackId === 'T1').sort((a, b) => a.start - b.start);
+    if (t1Clips.length === 0 || Object.keys(captionData).length === 0) {
+      throw new Error('No captions found. Add captions first so I can identify sections.');
+    }
+
+    const parts: string[] = [];
+    for (const clip of t1Clips) {
+      const cd = captionData[clip.id];
+      if (!cd?.words?.length) continue;
+      for (const word of cd.words) {
+        parts.push(`[${(clip.start + word.start).toFixed(1)}s] ${word.text}`);
+      }
+    }
+    const transcript = parts.join(' ');
+
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'resequence', instruction, transcript }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Resequence failed');
+    }
+
+    return response.json();
+  }, [session, clips, captionData]);
+
+  // Apply a resequence plan: move V1 clips so "from" section lands before "to"
+  const handleApplyResequence = useCallback(async (
+    swaps: Array<{ from: { startTime: number; endTime: number }; to: { startTime: number; endTime: number } }>
+  ): Promise<{ applied: boolean }> => {
+    if (!session) throw new Error('No session available');
+
+    const projectResponse = await fetch(`http://localhost:3333/session/${session.sessionId}/project`);
+    const projectData = await projectResponse.json();
+    let currentClips: TimelineClip[] = projectData.clips || [];
+
+    for (const swap of swaps) {
+      // Find V1 clips in the "from" range
+      const fromClips = currentClips.filter(c =>
+        c.trackId === 'V1' &&
+        c.start >= swap.from.startTime - 0.1 &&
+        c.start + c.duration <= swap.to.endTime + 0.1 &&
+        c.start < swap.from.endTime
+      );
+      // Find V1 clips in the "to" range
+      const toClips = currentClips.filter(c =>
+        c.trackId === 'V1' &&
+        c.start >= swap.to.startTime - 0.1 &&
+        c.start + c.duration <= swap.to.endTime + 0.1 &&
+        c.start < swap.to.endTime
+      );
+
+      if (fromClips.length === 0 || toClips.length === 0) continue;
+
+      // Swap their start positions (offset within each group preserved)
+      const fromBase = Math.min(...fromClips.map(c => c.start));
+      const toBase = Math.min(...toClips.map(c => c.start));
+      const fromDuration = swap.from.endTime - swap.from.startTime;
+      const toDuration = swap.to.endTime - swap.to.startTime;
+
+      for (const clip of fromClips) {
+        const offset = clip.start - fromBase;
+        const idx = currentClips.findIndex(c => c.id === clip.id);
+        currentClips[idx] = { ...clip, start: toBase + offset };
+      }
+      for (const clip of toClips) {
+        const offset = clip.start - toBase;
+        const idx = currentClips.findIndex(c => c.id === clip.id);
+        currentClips[idx] = { ...clip, start: fromBase + offset + (toDuration - fromDuration) };
+      }
+    }
+
+    await fetch(`http://localhost:3333/session/${session.sessionId}/project`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...projectData, clips: currentClips }),
+    });
+    await loadProject();
+    return { applied: true };
   }, [session, clips, loadProject]);
 
   // Handle auto-extract keywords and add GIFs
@@ -774,14 +1012,16 @@ export default function Home() {
     await refreshAssets();
 
     // Add each GIF to the timeline at its timestamp on the V2 (overlay) track
+    const addedClipIds: string[] = [];
     for (const gifInfo of data.gifAssets) {
-      addClip(gifInfo.assetId, 'V2', gifInfo.timestamp, 3); // 3 second duration for GIFs
+      const clip = addClip(gifInfo.assetId, 'V2', gifInfo.timestamp, 3); // 3 second duration for GIFs
+      if (clip) addedClipIds.push(clip.id);
     }
 
     // Save the project with the new clips
     await saveProject();
 
-    return data;
+    return { ...data, addedClipIds };
   }, [session, assets, addClip, saveProject, refreshAssets]);
 
   // Handle generating B-roll images and adding to timeline
@@ -796,10 +1036,29 @@ export default function Home() {
       throw new Error('Please upload a video first');
     }
 
+    // Build pre-built words+transcript from captionData if available (skips Whisper on server)
+    let brollBody: { text?: string; words?: Array<{ text: string; start: number; end: number }> } = {};
+    const t1BrollClips = clips.filter(c => c.trackId === 'T1').sort((a, b) => a.start - b.start);
+    if (t1BrollClips.length > 0 && Object.keys(captionData).length > 0) {
+      const words: Array<{ text: string; start: number; end: number }> = [];
+      for (const clip of t1BrollClips) {
+        const cd = captionData[clip.id];
+        if (!cd?.words?.length) continue;
+        for (const w of cd.words) {
+          words.push({ text: w.text, start: clip.start + w.start, end: clip.start + w.end });
+        }
+      }
+      if (words.length > 10) {
+        brollBody = { text: words.map(w => w.text).join(' '), words };
+        console.log(`Smart B-roll: using ${words.length} caption words for keyword extraction`);
+      }
+    }
+
     // Call the generate-broll endpoint
     const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-broll`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(brollBody),
     });
 
     if (!response.ok) {
@@ -867,7 +1126,7 @@ export default function Home() {
     console.log('B-roll clips added successfully!');
 
     return data;
-  }, [session, assets, refreshAssets, loadProject]);
+  }, [session, assets, clips, captionData, refreshAssets, loadProject]);
 
   // Handle removing dead air / silence from the video
   const handleRemoveDeadAir = useCallback(async (): Promise<{ duration: number; removedDuration: number }> => {
@@ -1044,15 +1303,19 @@ export default function Home() {
         };
       });
 
-      addCaptionClipsBatch(captionsToAdd);
-      await saveProject();
+      const { clips: newCaptionClips, captionData: newCaptionData } = addCaptionClipsBatch(captionsToAdd);
+
+      // Save immediately with explicit data — setClips/setCaptionData haven't propagated
+      // to clipsRef/captionDataRef yet, so saveProject() would read stale refs.
+      const savedClips = [...clips.filter(c => c.trackId !== 'T1'), ...newCaptionClips];
+      const savedCaptionData = { ...newCaptionData }; // only new entries; orphaned old entries are harmless
+      await saveProjectNow(savedClips, savedCaptionData);
       console.log(`Created ${chunks.length} caption clips`);
+      return { captionClipIds: newCaptionClips.map(c => c.id), ...data };
     } else {
       throw new Error('No speech detected in video. Make sure your video has audible speech.');
     }
-
-    return data;
-  }, [session, assets, clips, clearCaptionClips, addCaptionClipsBatch, saveProject]);
+  }, [session, assets, clips, clearCaptionClips, addCaptionClipsBatch, saveProjectNow]);
 
   // Handle updating caption style
   const handleUpdateCaptionStyle = useCallback((clipId: string, styleUpdates: Partial<CaptionStyle>) => {
@@ -1399,8 +1662,10 @@ export default function Home() {
     await refreshAssets();
 
     // Add each animation to the timeline at its planned position
+    const addedClipIds: string[] = [];
     for (const animation of data.animations) {
-      addClip(animation.assetId, 'V2', animation.startTime, animation.duration);
+      const clip = addClip(animation.assetId, 'V2', animation.startTime, animation.duration);
+      if (clip) addedClipIds.push(clip.id);
     }
 
     await saveProject();
@@ -1410,6 +1675,7 @@ export default function Home() {
     return {
       animations: data.animations,
       videoDuration: data.videoDuration,
+      addedClipIds,
     };
   }, [session, refreshAssets, addClip, saveProject]);
 
@@ -1445,6 +1711,9 @@ export default function Home() {
 
     const data = await response.json();
 
+    // Capture original V1 asset ID for undo
+    const originalV1AssetId = v1Clip.assetId;
+
     // Refresh assets to get the new audio and muted video assets
     await refreshAssets();
 
@@ -1452,7 +1721,7 @@ export default function Home() {
     updateClip(v1Clip.id, { assetId: data.mutedVideoAsset.id });
 
     // Add the audio to A1 track at the same position as the video
-    addClip(data.audioAsset.id, 'A1', v1Clip.start, data.audioAsset.duration);
+    const a1Clip = addClip(data.audioAsset.id, 'A1', v1Clip.start, data.audioAsset.duration);
 
     await saveProject();
 
@@ -1462,8 +1731,69 @@ export default function Home() {
       audioAsset: data.audioAsset,
       mutedVideoAsset: data.mutedVideoAsset,
       originalAssetId: data.originalAssetId,
+      addedA1ClipId: a1Clip?.id,
+      modifiedV1ClipId: v1Clip.id,
+      originalV1AssetId,
     };
   }, [session, clips, assets, refreshAssets, updateClip, addClip, saveProject]);
+
+  // Undo an additive AI workflow by removing the clips it added
+  const handleUndoWorkflow = useCallback(async (undoData: {
+    workflowType: 'captions' | 'batch-animations' | 'auto-gif' | 'extract-audio';
+    addedClipIds: string[];
+    originalV1AssetId?: string;
+    modifiedV1ClipId?: string;
+  }) => {
+    if (undoData.workflowType === 'extract-audio' && undoData.modifiedV1ClipId && undoData.originalV1AssetId) {
+      // Restore the original video asset on V1 before removing the A1 clip
+      updateClip(undoData.modifiedV1ClipId, { assetId: undoData.originalV1AssetId });
+    }
+    const newClips = clips.filter(c => !undoData.addedClipIds.includes(c.id));
+    undoWorkflowClips(undoData.addedClipIds);
+    await saveProjectNow(newClips);
+  }, [clips, updateClip, undoWorkflowClips, saveProjectNow]);
+
+  // Preview batch animations (renders but does NOT add to timeline) — for storyboard UI
+  const handlePreviewBatchAnimations = useCallback(async (count: number) => {
+    if (!session?.sessionId) {
+      throw new Error('Please upload a video first to start a session');
+    }
+
+    const response = await fetch(`http://localhost:3333/session/${session.sessionId}/generate-batch-animations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count, fps: 30, width: 1920, height: 1080 }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to generate animations');
+    }
+
+    const data = await response.json();
+
+    // Refresh assets so thumbnails are available
+    const refreshed = await refreshAssets();
+
+    // Attach thumbnailUrl from the refreshed asset list
+    const withThumbs = data.animations.map((anim: { assetId: string; filename: string; duration: number; startTime: number; type: string; title: string }) => {
+      const asset = refreshed?.find((a: { id: string; thumbnailUrl?: string | null }) => a.id === anim.assetId);
+      return { ...anim, thumbnailUrl: asset?.thumbnailUrl ?? undefined };
+    });
+
+    return { animations: withThumbs, videoDuration: data.videoDuration };
+  }, [session, refreshAssets]);
+
+  // Apply previewed batch animations to the timeline
+  const handleApplyBatchAnimations = useCallback(async (animations: Array<{ assetId: string; startTime: number; duration: number }>) => {
+    const addedClipIds: string[] = [];
+    for (const anim of animations) {
+      const clip = addClip(anim.assetId, 'V2', anim.startTime, anim.duration);
+      if (clip) addedClipIds.push(clip.id);
+    }
+    await saveProject();
+    return { addedClipIds };
+  }, [addClip, saveProject]);
 
   // Handle contextual animation creation (uses video content to inform the animation)
   const handleCreateContextualAnimation = useCallback(async (request: {
@@ -1901,6 +2231,7 @@ export default function Home() {
               onToggleAutoSnap={() => setAutoSnap(prev => !prev)}
               onDropAsset={handleDropAsset}
               onSave={saveProject}
+              onDeleteAllCaptionClips={handleClearAllCaptionClips}
               getCaptionData={getCaptionData}
             />
           </ResizableVerticalPanel>
@@ -1969,6 +2300,9 @@ export default function Home() {
                   onGenerateTranscriptAnimation={handleGenerateTranscriptAnimation}
                   onGenerateBatchAnimations={handleGenerateBatchAnimations}
                   onExtractAudio={handleExtractAudio}
+                  onUndoWorkflow={handleUndoWorkflow}
+                  onPreviewBatchAnimations={handlePreviewBatchAnimations}
+                  onApplyBatchAnimations={handleApplyBatchAnimations}
                   onCreateContextualAnimation={handleCreateContextualAnimation}
                   onOpenAnimationInTab={handleOpenAnimationInTab}
                   onEditAnimation={handleEditAnimation}
@@ -1984,6 +2318,13 @@ export default function Home() {
                   activeTabId={activeTabId}
                   editTabAssetId={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.assetId : undefined}
                   editTabClips={activeTabId !== 'main' ? timelineTabs.find(t => t.id === activeTabId)?.clips : undefined}
+                  captionData={captionData}
+                  onUpdateCaptionWords={updateCaptionWords}
+                  onSceneDetect={handleSceneDetect}
+                  onApplySceneCuts={handleApplySceneCuts}
+                  onMuteFillerWords={handleMuteFillerWords}
+                  onResequence={handleResequence}
+                  onApplyResequence={handleApplyResequence}
                 />
               </div>
               <div className={`absolute inset-0 ${activeAgent === 'picasso' ? '' : 'hidden'}`}>

@@ -26,6 +26,7 @@ interface TimelineProps {
   onToggleAutoSnap?: () => void;
   onDropAsset: (asset: Asset, trackId: string, time: number) => void;
   onSave: () => void;
+  onDeleteAllCaptionClips?: () => void;
   getCaptionData?: (clipId: string) => CaptionData | null;
 }
 
@@ -64,6 +65,7 @@ export default function Timeline({
   onToggleAutoSnap,
   onDropAsset,
   onSave,
+  onDeleteAllCaptionClips,
   getCaptionData,
 }: TimelineProps) {
   const [zoom, setZoom] = useState(1);
@@ -365,9 +367,13 @@ export default function Timeline({
                       className="p-0.5 rounded hover:bg-red-500/20 hover:text-red-400 transition-colors flex-shrink-0"
                       onClick={() => {
                         if (confirm(`Delete all ${trackClipCount} captions on ${track.name}?`)) {
-                          clips
-                            .filter(c => c.trackId === track.id)
-                            .forEach(c => onDeleteClip(c.id));
+                          if (onDeleteAllCaptionClips) {
+                            onDeleteAllCaptionClips();
+                          } else {
+                            clips
+                              .filter(c => c.trackId === track.id)
+                              .forEach(c => onDeleteClip(c.id));
+                          }
                         }
                       }}
                     >

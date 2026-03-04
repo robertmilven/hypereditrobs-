@@ -1,6 +1,6 @@
-import { useState, useRef, useEffect } from 'react';
-import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move } from 'lucide-react';
-import type { TimelineClip, Track, Asset } from '@/react-app/hooks/useProject';
+import { useState, useRef, useEffect, useMemo } from 'react';
+import { Sparkles, Send, Wand2, Clock, Terminal, CheckCircle, Loader2, VolumeX, FileVideo, Type, Image, Zap, X, Scissors, Plus, Film, Music, MapPin, Timer, ImagePlus, Move, Star, Globe } from 'lucide-react';
+import type { TimelineClip, Track, Asset, CaptionData, CaptionWord } from '@/react-app/hooks/useProject';
 import { MOTION_TEMPLATES, type TemplateId } from '@/remotion/templates';
 import MotionGraphicsPanel from './MotionGraphicsPanel';
 
@@ -58,11 +58,49 @@ interface ChatMessage {
   animationName?: string;
   // For in-place animation edits (no "open in tab" button needed)
   isInPlaceEdit?: boolean;
+  // For undo support on additive workflows
+  undoData?: {
+    workflowType: 'captions' | 'batch-animations' | 'auto-gif' | 'extract-audio';
+    addedClipIds: string[];
+    originalV1AssetId?: string;
+    modifiedV1ClipId?: string;
+  };
+  undone?: boolean;
+  // For storyboard preview (batch animations before applying to timeline)
+  pendingBatchAnimations?: BatchAnimationResult[];
+  batchAnimationsApplied?: boolean;
+  // For audit/critic workflow
+  auditResults?: AuditResult[];
+  // For explain-before-execute confirm card
+  confirmWorkflow?: string;
+  confirmData?: { description: string; details: string[] };
+  confirmed?: boolean;
+  declined?: boolean;
+  // For scene detect result card
+  sceneDetectResult?: { scenes: Array<{ timestamp: number }>; applied?: boolean };
+  // For resequence result card
+  resequenceResult?: {
+    swaps: Array<{ from: { startTime: number; endTime: number; label: string }; to: { startTime: number; endTime: number; label: string } }>;
+    explanation: string;
+    applied?: boolean;
+  };
 }
 
 interface CaptionOptions {
   highlightColor: string;
   fontFamily: string;
+}
+
+interface PlatformPreset {
+  id: string;
+  label: string;
+  emoji: string;
+  width: number;
+  height: number;
+  aspectRatio: string;
+  lufs: number;
+  keywords: string[];
+  command: string;
 }
 
 interface ChapterCutResult {
@@ -90,6 +128,28 @@ interface BatchAnimationResult {
   startTime: number;
   type: 'intro' | 'highlight' | 'transition' | 'callout' | 'outro';
   title: string;
+  thumbnailUrl?: string;
+}
+
+interface TimelineSummary {
+  videoDuration: number;
+  captionCount: number;
+  hasCaptions: boolean;
+  animationCount: number;
+  hasAnimations: boolean;
+  gifCount: number;
+  hasGifs: boolean;
+  brollCount: number;
+  hasBroll: boolean;
+  hasAudioTrack: boolean;
+  isEmptyTimeline: boolean;
+}
+
+interface AuditResult {
+  severity: 'warning' | 'info' | 'good';
+  message: string;
+  fixLabel?: string;
+  fixWorkflow?: 'captions' | 'batch-animations' | 'auto-gif' | 'extract-audio';
 }
 
 interface ExtractAudioResult {
@@ -110,6 +170,19 @@ interface ContextualAnimationRequest {
   type: 'intro' | 'outro' | 'transition' | 'highlight';
   description?: string;
   timeRange?: { start: number; end: number };
+}
+
+interface RecipeStep {
+  workflowType: 'dead-air' | 'captions' | 'chapter-cuts' | 'batch-animations' | 'auto-gif' | 'extract-audio';
+  label: string;
+  count?: number;
+}
+
+interface Recipe {
+  id: string;
+  label: string;
+  description: string;
+  steps: RecipeStep[];
 }
 
 // Animation concept returned from analysis (for approval workflow)
@@ -165,8 +238,8 @@ interface EditTabV1Context {
 
 interface AIPromptPanelProps {
   onApplyEdit?: (command: string) => Promise<void>;
-  onExtractKeywordsAndAddGifs?: () => Promise<void>;
-  onTranscribeAndAddCaptions?: (options?: CaptionOptions) => Promise<void>;
+  onExtractKeywordsAndAddGifs?: () => Promise<{ addedClipIds: string[] } | void>;
+  onTranscribeAndAddCaptions?: (options?: CaptionOptions) => Promise<{ captionClipIds: string[] } | void>;
   onGenerateBroll?: () => Promise<void>;
   onRemoveDeadAir?: () => Promise<{ duration: number; removedDuration: number }>;
   onChapterCuts?: () => Promise<ChapterCutResult>;
@@ -177,8 +250,11 @@ interface AIPromptPanelProps {
   onRenderFromConcept?: (concept: AnimationConcept) => Promise<CustomAnimationResult>;
   onCreateContextualAnimation?: (request: ContextualAnimationRequest) => Promise<CustomAnimationResult>;
   onGenerateTranscriptAnimation?: () => Promise<CustomAnimationResult>;
-  onGenerateBatchAnimations?: (count: number) => Promise<{ animations: BatchAnimationResult[]; videoDuration: number }>;
-  onExtractAudio?: () => Promise<ExtractAudioResult>;
+  onGenerateBatchAnimations?: (count: number) => Promise<{ animations: BatchAnimationResult[]; videoDuration: number; addedClipIds?: string[] }>;
+  onExtractAudio?: () => Promise<ExtractAudioResult & { addedA1ClipId?: string; modifiedV1ClipId?: string; originalV1AssetId?: string }>;
+  onUndoWorkflow?: (undoData: NonNullable<ChatMessage['undoData']>) => Promise<void>;
+  onPreviewBatchAnimations?: (count: number) => Promise<{ animations: BatchAnimationResult[]; videoDuration: number }>;
+  onApplyBatchAnimations?: (animations: BatchAnimationResult[]) => Promise<{ addedClipIds: string[] }>;
   onOpenAnimationInTab?: (assetId: string, animationName: string) => string | undefined;
   onEditAnimation?: (assetId: string, editPrompt: string, v1Context?: EditTabV1Context, tabIdToUpdate?: string) => Promise<{ assetId: string; duration: number; sceneCount: number }>;
   isApplying?: boolean;
@@ -195,6 +271,20 @@ interface AIPromptPanelProps {
   activeTabId?: string;
   editTabAssetId?: string;
   editTabClips?: TimelineClip[]; // Clips in the edit tab's timeline
+  // Caption data for polish/filler word removal
+  captionData?: Record<string, CaptionData>;
+  onUpdateCaptionWords?: (clipId: string, words: CaptionWord[]) => void;
+  // Scene detection
+  onSceneDetect?: () => Promise<{ scenes: Array<{ timestamp: number }> }>;
+  onApplySceneCuts?: (timestamps: number[]) => Promise<{ cutsApplied: number }>;
+  // Filler word audio muting
+  onMuteFillerWords?: (fillerWords: Set<string>) => Promise<{ mutedCount: number }>;
+  // Section resequencing
+  onResequence?: (instruction: string) => Promise<{
+    swaps: Array<{ from: { startTime: number; endTime: number; label: string }; to: { startTime: number; endTime: number; label: string } }>;
+    explanation: string;
+  }>;
+  onApplyResequence?: (swaps: Array<{ from: { startTime: number; endTime: number }; to: { startTime: number; endTime: number } }>) => Promise<{ applied: boolean }>;
 }
 
 export default function AIPromptPanel({
@@ -213,6 +303,9 @@ export default function AIPromptPanel({
   onGenerateTranscriptAnimation,
   onGenerateBatchAnimations,
   onExtractAudio,
+  onUndoWorkflow,
+  onPreviewBatchAnimations,
+  onApplyBatchAnimations,
   onOpenAnimationInTab,
   onEditAnimation,
   isApplying,
@@ -227,6 +320,13 @@ export default function AIPromptPanel({
   activeTabId = 'main',
   editTabAssetId,
   editTabClips = [],
+  captionData,
+  onUpdateCaptionWords,
+  onSceneDetect,
+  onApplySceneCuts,
+  onMuteFillerWords,
+  onResequence,
+  onApplyResequence,
 }: AIPromptPanelProps) {
   const [prompt, setPrompt] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -249,13 +349,25 @@ export default function AIPromptPanel({
   const referencePickerRef = useRef<HTMLDivElement>(null);
   const timeRangePickerRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-  const [captionOptions, setCaptionOptions] = useState<CaptionOptions>({
-    highlightColor: '#FFD700',
-    fontFamily: 'Inter',
+  const [captionOptions, setCaptionOptions] = useState<CaptionOptions>(() => {
+    try {
+      const saved = localStorage.getItem('clipwise-caption-style');
+      return saved ? JSON.parse(saved) : { highlightColor: '#FFD700', fontFamily: 'Inter' };
+    } catch { return { highlightColor: '#FFD700', fontFamily: 'Inter' }; }
+  });
+  const [savedPrompts, setSavedPrompts] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('clipwise-saved-prompts');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
   });
   const [pendingQuestion, setPendingQuestion] = useState<ClarifyingQuestion | null>(null);
   const [pendingAnimationConcept, setPendingAnimationConcept] = useState<AnimationConcept | null>(null);
   const [applyingIndex, setApplyingIndex] = useState<number | null>(null);
+  const [showRecipes, setShowRecipes] = useState(false);
+  const recipesRef = useRef<HTMLDivElement>(null);
+  const [showPlatforms, setShowPlatforms] = useState(false);
+  const platformsRef = useRef<HTMLDivElement>(null);
 
   // Intentionally unused - kept for backwards compatibility
   void _onCreateContextualAnimation;
@@ -297,6 +409,32 @@ export default function AIPromptPanel({
     }
   }, [showQuickActions]);
 
+  // Close recipes when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (recipesRef.current && !recipesRef.current.contains(event.target as Node)) {
+        setShowRecipes(false);
+      }
+    };
+
+    if (showRecipes) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [showRecipes]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (platformsRef.current && !platformsRef.current.contains(event.target as Node)) {
+        setShowPlatforms(false);
+      }
+    };
+    if (showPlatforms) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [showPlatforms]);
+
   // Close reference picker when clicking outside
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -336,6 +474,44 @@ export default function AIPromptPanel({
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
+
+  // Computed timeline summary — updated any time clips or assets change
+  const timelineSummary = useMemo((): TimelineSummary => {
+    const v1Clips = clips.filter(c => c.trackId === 'V1');
+    const t1Clips = clips.filter(c => c.trackId === 'T1');
+    const v2Clips = clips.filter(c => c.trackId === 'V2');
+    const v3Clips = clips.filter(c => c.trackId === 'V3');
+    const a1Clips = clips.filter(c => c.trackId === 'A1');
+    const a2Clips = clips.filter(c => c.trackId === 'A2');
+
+    const videoDuration = v1Clips.reduce((max, c) => Math.max(max, c.start + c.duration), 0);
+
+    const animationClips = v2Clips.filter(c => assets.find(a => a.id === c.assetId)?.aiGenerated);
+    const gifClips = v2Clips.filter(c => {
+      const asset = assets.find(a => a.id === c.assetId);
+      return asset && !asset.aiGenerated;
+    });
+
+    const captionCount = t1Clips.length;
+    const animationCount = animationClips.length;
+    const gifCount = gifClips.length;
+    const brollCount = v3Clips.length;
+    const hasAudioTrack = a1Clips.length > 0 || a2Clips.length > 0;
+
+    return {
+      videoDuration,
+      captionCount,
+      hasCaptions: captionCount > 0,
+      animationCount,
+      hasAnimations: animationCount > 0,
+      gifCount,
+      hasGifs: gifCount > 0,
+      brollCount,
+      hasBroll: brollCount > 0,
+      hasAudioTrack,
+      isEmptyTimeline: clips.length === 0,
+    };
+  }, [clips, assets]);
 
   // Parse time string (M:SS or MM:SS) to seconds
   const parseTimeString = (timeStr: string): number | null => {
@@ -553,6 +729,134 @@ export default function AIPromptPanel({
     'Inter', 'Roboto', 'Poppins', 'Montserrat', 'Oswald', 'Bebas Neue', 'Arial', 'Helvetica'
   ];
 
+  const PLATFORM_PRESETS: PlatformPreset[] = [
+    {
+      id: 'youtube',
+      label: 'YouTube',
+      emoji: '▶',
+      width: 1920, height: 1080, aspectRatio: '16:9', lufs: -16,
+      keywords: ['youtube', 'yt'],
+      command: 'ffmpeg -i input.mp4 -vf "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2" -af "loudnorm=I=-16:TP=-1.5:LRA=11" -c:v libx264 -preset slow -crf 18 -c:a aac -b:a 192k output.mp4',
+    },
+    {
+      id: 'tiktok',
+      label: 'TikTok / Shorts',
+      emoji: '♪',
+      width: 1080, height: 1920, aspectRatio: '9:16', lufs: -14,
+      keywords: ['tiktok', 'tik tok', 'shorts', 'vertical video'],
+      command: 'ffmpeg -i input.mp4 -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -af "loudnorm=I=-14:TP=-1.5:LRA=11" -c:v libx264 -preset slow -crf 18 -c:a aac -b:a 192k output.mp4',
+    },
+    {
+      id: 'reels',
+      label: 'Instagram Reels',
+      emoji: '◎',
+      width: 1080, height: 1920, aspectRatio: '9:16', lufs: -14,
+      keywords: ['reels', 'instagram reels'],
+      command: 'ffmpeg -i input.mp4 -vf "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2" -af "loudnorm=I=-14:TP=-1.5:LRA=11" -c:v libx264 -preset slow -crf 18 -c:a aac -b:a 192k output.mp4',
+    },
+    {
+      id: 'instagram',
+      label: 'Instagram Square',
+      emoji: '□',
+      width: 1080, height: 1080, aspectRatio: '1:1', lufs: -14,
+      keywords: ['instagram square', 'square video'],
+      command: 'ffmpeg -i input.mp4 -vf "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2" -af "loudnorm=I=-14:TP=-1.5:LRA=11" -c:v libx264 -preset slow -crf 18 -c:a aac -b:a 192k output.mp4',
+    },
+    {
+      id: 'twitter',
+      label: 'Twitter / X',
+      emoji: '✕',
+      width: 1280, height: 720, aspectRatio: '16:9', lufs: -14,
+      keywords: ['twitter', 'tweet'],
+      command: 'ffmpeg -i input.mp4 -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" -af "loudnorm=I=-14:TP=-1.5:LRA=11" -c:v libx264 -preset slow -crf 18 -c:a aac -b:a 192k output.mp4',
+    },
+  ];
+
+  const RECIPES: Recipe[] = [
+    {
+      id: 'youtube-ready',
+      label: 'YouTube-Ready',
+      description: 'Remove silence → captions → chapters → 5 animations',
+      steps: [
+        { workflowType: 'dead-air',         label: 'Removing dead air...' },
+        { workflowType: 'captions',         label: 'Adding captions...' },
+        { workflowType: 'chapter-cuts',     label: 'Cutting at chapters...' },
+        { workflowType: 'batch-animations', label: 'Adding animations...', count: 5 },
+      ],
+    },
+    {
+      id: 'podcast-polish',
+      label: 'Podcast Polish',
+      description: 'Remove silence → extract audio → add captions',
+      steps: [
+        { workflowType: 'dead-air',      label: 'Removing dead air...' },
+        { workflowType: 'extract-audio', label: 'Extracting audio...' },
+        { workflowType: 'captions',      label: 'Adding captions...' },
+      ],
+    },
+    {
+      id: 'social-clip',
+      label: 'Social Clip',
+      description: 'Remove silence → captions → 3 GIF overlays',
+      steps: [
+        { workflowType: 'dead-air', label: 'Removing dead air...' },
+        { workflowType: 'captions', label: 'Adding captions...' },
+        { workflowType: 'auto-gif', label: 'Adding GIF overlays...' },
+      ],
+    },
+    {
+      id: 'tutorial',
+      label: 'Tutorial',
+      description: 'Remove silence → captions → chapter each step → 4 step animations',
+      steps: [
+        { workflowType: 'dead-air',         label: 'Removing dead air...' },
+        { workflowType: 'captions',         label: 'Adding captions...' },
+        { workflowType: 'chapter-cuts',     label: 'Cutting at chapters...' },
+        { workflowType: 'batch-animations', label: 'Adding step animations...', count: 4 },
+      ],
+    },
+    {
+      id: 'talking-head',
+      label: 'Talking Head',
+      description: 'Remove silence → captions → extract audio to A1',
+      steps: [
+        { workflowType: 'dead-air',      label: 'Removing dead air...' },
+        { workflowType: 'captions',      label: 'Adding captions...' },
+        { workflowType: 'extract-audio', label: 'Extracting audio...' },
+      ],
+    },
+    {
+      id: 'viral-short',
+      label: 'Viral Short',
+      description: 'Remove silence → GIF overlays → captions',
+      steps: [
+        { workflowType: 'dead-air', label: 'Removing dead air...' },
+        { workflowType: 'auto-gif', label: 'Adding GIF overlays...' },
+        { workflowType: 'captions', label: 'Adding captions...' },
+      ],
+    },
+    {
+      id: 'interview',
+      label: 'Interview',
+      description: 'Remove silence → captions → chapter by topic',
+      steps: [
+        { workflowType: 'dead-air',     label: 'Removing dead air...' },
+        { workflowType: 'captions',     label: 'Adding captions...' },
+        { workflowType: 'chapter-cuts', label: 'Cutting at chapters...' },
+      ],
+    },
+    {
+      id: 'product-demo',
+      label: 'Product Demo',
+      description: 'Captions → 5 feature animations → chapter sections',
+      steps: [
+        { workflowType: 'captions',         label: 'Adding captions...' },
+        { workflowType: 'batch-animations', label: 'Adding feature animations...', count: 5 },
+        { workflowType: 'chapter-cuts',     label: 'Cutting at chapters...' },
+      ],
+    },
+  ];
+
   const suggestions = [
     { icon: Type, text: 'Add captions' },
     { icon: VolumeX, text: 'Remove dead air / silence' },
@@ -567,6 +871,31 @@ export default function AIPromptPanel({
     { icon: Move, text: 'Add Ken Burns zoom effect' },
     { icon: Music, text: 'Extract audio to A1' },
   ];
+
+  // Persist caption style to localStorage whenever it changes
+  useEffect(() => {
+    localStorage.setItem('clipwise-caption-style', JSON.stringify(captionOptions));
+  }, [captionOptions]);
+
+  const savePrompt = (text: string) => {
+    // Strip any time-range or @ref prefixes before saving
+    const clean = text.replace(/^\[[\d:]+\s*-\s*[\d:]+\]\s*/, '').replace(/^(@\S+\s*)+/, '').trim();
+    if (!clean) return;
+    setSavedPrompts(prev => {
+      if (prev.includes(clean)) return prev;
+      const updated = [clean, ...prev].slice(0, 8);
+      localStorage.setItem('clipwise-saved-prompts', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  const removePrompt = (text: string) => {
+    setSavedPrompts(prev => {
+      const updated = prev.filter(p => p !== text);
+      localStorage.setItem('clipwise-saved-prompts', JSON.stringify(updated));
+      return updated;
+    });
+  };
 
   // Check if prompt is asking for a contextual animation (intro/outro that needs video context)
   // Note: This is still used by the contextual-animation workflow
@@ -906,6 +1235,14 @@ export default function AIPromptPanel({
     | 'transcript-animation' // Kinetic typography from speech
     | 'contextual-animation' // Animation based on video content
     | 'extract-audio'       // Extract audio to separate track
+    | 'audit'               // Audit timeline and give improvement feedback
+    | 'audio-clean'        // Noise reduction + high-pass filter
+    | 'audio-normalize'    // EBU R128 loudness normalization
+    | 'caption-polish'     // Remove filler words from caption word list
+    | 'platform-preset'    // Re-encode for YouTube / TikTok / Reels / etc.
+    | 'scene-detect'       // Detect scene changes via FFmpeg
+    | 'filler-cut'         // Mute filler words in audio using caption timestamps
+    | 'resequence'         // Reorder sections via caption transcript + Gemini
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
     | 'unknown';            // Need to ask for clarification
 
@@ -922,10 +1259,63 @@ export default function AIPromptPanel({
     hasAiAnimationsOnTimeline: boolean;
     selectedClipIsAiAnimation: boolean;
     selectedAiAnimationAssetId?: string;
+    timelineSummary: TimelineSummary;
   }
+
+  // Extract a count like "5 animations" or "animations x3" from text
+  const extractCountFromText = (text: string, keyword: string): number => {
+    const m = text.match(new RegExp(`(\\d+)\\s+${keyword}`, 'i'))
+             || text.match(new RegExp(`${keyword}s?\\s+x\\s*(\\d+)`, 'i'));
+    return m ? parseInt(m[1]) : 3;
+  };
+
+  // Convert a workflow type to a RecipeStep for multi-intent runs
+  const workflowToStep = (wf: WorkflowType, text: string): RecipeStep | null => {
+    switch (wf) {
+      case 'dead-air': return { workflowType: 'dead-air', label: 'Removing dead air...' };
+      case 'captions': return { workflowType: 'captions', label: 'Adding captions...' };
+      case 'auto-gif': return { workflowType: 'auto-gif', label: 'Adding GIF overlays...' };
+      case 'extract-audio': return { workflowType: 'extract-audio', label: 'Extracting audio...' };
+      case 'batch-animations': return {
+        workflowType: 'batch-animations',
+        label: 'Adding animations...',
+        count: extractCountFromText(text, 'animation'),
+      };
+      default: return null;
+    }
+  };
+
+  // Detect multiple intents in a single prompt (e.g. "remove silence and add captions")
+  const detectMultipleIntents = (text: string): RecipeStep[] | null => {
+    const hasConnector = /\b(and|then|also|\+|,)\b/i.test(text);
+    if (!hasConnector) return null;
+
+    const INTENT_KEYWORDS: Array<[RegExp, WorkflowType]> = [
+      [/remove\s+(dead\s+air|silence|gaps?)/i, 'dead-air'],
+      [/(add|generate|create)\s+captions?/i, 'captions'],
+      [/\d+\s+animations?|add\s+animations?/i, 'batch-animations'],
+      [/(add|find|search)\s+gifs?/i, 'auto-gif'],
+      [/extract\s+audio/i, 'extract-audio'],
+    ];
+
+    const found: WorkflowType[] = [];
+    for (const [regex, wf] of INTENT_KEYWORDS) {
+      if (regex.test(text) && !found.includes(wf)) found.push(wf);
+    }
+
+    if (found.length < 2) return null;
+    return found.map(wf => workflowToStep(wf, text)).filter(Boolean) as RecipeStep[];
+  };
 
   const determineWorkflow = (ctx: DirectorContext): WorkflowType => {
     const lower = ctx.prompt.toLowerCase();
+
+    // ============================================
+    // AUDIT / CRITIC INTENT — check first
+    // ============================================
+    if (/\b(audit|critique|rate|assess|what.?s wrong|how.?s my|check my video|analyze my project|how does it look|score my|give me feedback|review my)\b/i.test(lower)) {
+      return 'audit';
+    }
 
     // ============================================
     // CONTEXT-AWARE DECISIONS
@@ -979,6 +1369,15 @@ export default function AIPromptPanel({
     // ============================================
     // INTENT-BASED DECISIONS (when not in edit tab)
     // ============================================
+
+    // Caption polish — filler word removal (check before generic caption route)
+    if (lower.includes('filler') || lower.includes('remove um') || lower.includes('remove uh') ||
+        lower.includes('clean captions') || lower.includes('polish captions') ||
+        lower.includes('clean transcript') || lower.includes('polish transcript') ||
+        (lower.includes('remove') && (lower.includes('filler') || lower.includes('ums') || lower.includes('uhs'))) ||
+        lower.includes('caption cleanup') || lower.includes('caption clean')) {
+      return 'caption-polish';
+    }
 
     // Caption-related requests
     if (lower.includes('caption') || lower.includes('subtitle') ||
@@ -1101,6 +1500,58 @@ export default function AIPromptPanel({
       return 'create-animation';
     }
 
+    // Platform presets (intercept before generic ffmpeg-edit)
+    const platformMatch = PLATFORM_PRESETS.find(p => p.keywords.some(k => lower.includes(k)));
+    if (platformMatch ||
+        lower.includes('export for') || lower.includes('optimize for') || lower.includes('format for') ||
+        lower.includes('ready for') || (lower.includes('export') && (lower.includes('platform') || lower.includes('social')))) {
+      return 'platform-preset';
+    }
+
+    // Audio clean — noise reduction (intercept before generic ffmpeg-edit)
+    if ((lower.includes('clean') && lower.includes('audio')) ||
+        lower.includes('remove noise') || lower.includes('reduce noise') ||
+        lower.includes('background noise') || lower.includes('denoise') ||
+        lower.includes('noise reduction') || lower.includes('noise clean')) {
+      return 'audio-clean';
+    }
+
+    // Audio normalize — loudness (intercept before generic ffmpeg-edit)
+    if ((lower.includes('normaliz') || lower.includes('normalise')) &&
+        (lower.includes('audio') || lower.includes('loud') || lower.includes('sound') || lower.includes('volume')) ||
+        lower.includes('too quiet') || lower.includes('too loud') ||
+        lower.includes('audio levels') || lower.includes('lufs')) {
+      return 'audio-normalize';
+    }
+
+    // Filler word audio muting
+    if ((lower.includes('mute') || lower.includes('remove') || lower.includes('cut')) &&
+        (lower.includes('filler') || lower.includes('um') || lower.includes('uh') ||
+         lower.includes('filler word') || lower.includes('verbal tick') || lower.includes('speech habit'))) {
+      return 'filler-cut';
+    }
+    if (lower.includes('mute filler') || lower.includes('cut um') || lower.includes('remove um') ||
+        lower.includes('clean speech') || lower.includes('remove uh')) {
+      return 'filler-cut';
+    }
+
+    // Section resequencing (move X before/after Y)
+    if ((lower.includes('move') || lower.includes('swap') || lower.includes('reorder') || lower.includes('rearrange')) &&
+        (lower.includes('before') || lower.includes('after') || lower.includes('section') || lower.includes('part'))) {
+      return 'resequence';
+    }
+    if (lower.includes('resequence') || lower.includes('re-sequence') ||
+        lower.includes('rearrange sections') || lower.includes('swap sections')) {
+      return 'resequence';
+    }
+
+    // Scene detection
+    if (lower.includes('scene detect') || lower.includes('detect scene') ||
+        lower.includes('scene change') || lower.includes('find cut') ||
+        lower.includes('find scene') || lower.includes('scene cut')) {
+      return 'scene-detect';
+    }
+
     // FFmpeg-style video edits (trim, cut, speed, audio, noise, etc.)
     if (lower.includes('trim') || lower.includes('cut') || lower.includes('speed') ||
         lower.includes('slow') || lower.includes('fast') || lower.includes('reverse') ||
@@ -1163,6 +1614,118 @@ export default function AIPromptPanel({
     }
   };
 
+  // Handle scene detect workflow
+  const handleSceneDetectWorkflow = async () => {
+    if (!onSceneDetect) return;
+
+    setIsProcessing(true);
+    setProcessingStatus('Scanning for scene changes...');
+
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: '🎬 Scanning your video for scene changes...',
+    }]);
+
+    try {
+      const { scenes } = await onSceneDetect();
+
+      if (scenes.length === 0) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'No scene changes detected. The video may be a single continuous shot.',
+        }]);
+        return;
+      }
+
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `Found ${scenes.length} scene change${scenes.length !== 1 ? 's' : ''}. Click "Cut at scenes" to split your video at these points.`,
+        sceneDetectResult: { scenes },
+      }]);
+
+    } catch (error) {
+      console.error('Scene detect failed:', error);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `❌ Scene detection failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Handle filler word audio muting
+  const handleFillerCutWorkflow = async () => {
+    if (!onMuteFillerWords) return;
+
+    setIsProcessing(true);
+    setProcessingStatus('Muting filler words...');
+
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: '🔇 Muting filler words (um, uh, like...) in your audio...',
+    }]);
+
+    try {
+      const { mutedCount } = await onMuteFillerWords(FILLER_WORDS);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `✅ Muted ${mutedCount} filler word${mutedCount !== 1 ? 's' : ''} in the audio. The video is unchanged — only the sound is silenced at those moments.`,
+      }]);
+    } catch (error) {
+      console.error('Filler cut failed:', error);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `❌ Filler word muting failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Handle section resequencing
+  const handleResequenceWorkflow = async (userMessage: string) => {
+    if (!onResequence) return;
+
+    setIsProcessing(true);
+    setProcessingStatus('Analyzing sections...');
+
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: '🔄 Analyzing your video sections...',
+    }]);
+
+    try {
+      const result = await onResequence(userMessage);
+
+      if (!result.swaps || result.swaps.length === 0) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'I couldn\'t identify the sections you want to move. Try being more specific, e.g. "move the pricing section before the demo section".',
+        }]);
+        return;
+      }
+
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: result.explanation || 'Here\'s what I found:',
+        resequenceResult: result,
+      }]);
+
+    } catch (error) {
+      console.error('Resequence failed:', error);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `❌ Resequencing failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
   // Poll for job completion
   const pollForResult = async (jobId: string, maxAttempts = 60): Promise<any> => {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -1207,12 +1770,12 @@ export default function AIPromptPanel({
     try {
       setChatHistory(prev => [...prev, {
         type: 'assistant',
-        text: `Transcribing your video...\n\n1. Extracting audio from video\n2. Running local Whisper for accurate timestamps\n3. Adding captions to T1 track\n\nFont: ${captionOptions.fontFamily}\nHighlight: ${captionOptions.highlightColor}`,
+        text: `Transcribing your ${formatTimeShort(timelineSummary.videoDuration)} video...${timelineSummary.hasCaptions ? ` Replacing ${timelineSummary.captionCount} existing captions.` : ''}\n\n1. Extracting audio from video\n2. Running local Whisper for accurate timestamps\n3. Adding captions to T1 track\n\nFont: ${captionOptions.fontFamily}\nHighlight: ${captionOptions.highlightColor}`,
         isProcessingGifs: true,
         isCaptionWorkflow: true,
       }]);
 
-      await onTranscribeAndAddCaptions(captionOptions);
+      const captionResult = await onTranscribeAndAddCaptions(captionOptions);
 
       // Update the last message to show completion
       setChatHistory(prev => {
@@ -1225,6 +1788,10 @@ export default function AIPromptPanel({
             isProcessingGifs: false,
             applied: true,
             isCaptionWorkflow: true,
+            undoData: {
+              workflowType: 'captions',
+              addedClipIds: (captionResult as { captionClipIds?: string[] } | null)?.captionClipIds ?? [],
+            },
           };
         }
         return updated;
@@ -1252,11 +1819,11 @@ export default function AIPromptPanel({
     try {
       setChatHistory(prev => [...prev, {
         type: 'assistant',
-        text: 'Analyzing your video for keywords and brands...\n\n1. Extracting audio and transcribing\n2. Finding keywords and brands\n3. Searching for relevant GIFs\n4. Adding to timeline at correct timestamps',
+        text: `Analyzing your ${formatTimeShort(timelineSummary.videoDuration)} video for keywords and brands...\n\n1. Extracting audio and transcribing\n2. Finding keywords and brands\n3. Searching for relevant GIFs\n4. Adding to timeline at correct timestamps`,
         isProcessingGifs: true,
       }]);
 
-      await onExtractKeywordsAndAddGifs();
+      const gifResult = await onExtractKeywordsAndAddGifs();
 
       // Update the last message to show completion
       setChatHistory(prev => {
@@ -1268,6 +1835,10 @@ export default function AIPromptPanel({
             text: 'Keywords extracted, GIFs found, and added to your timeline!',
             isProcessingGifs: false,
             applied: true,
+            undoData: {
+              workflowType: 'auto-gif',
+              addedClipIds: (gifResult as { addedClipIds?: string[] } | null)?.addedClipIds ?? [],
+            },
           };
         }
         return updated;
@@ -1882,9 +2453,10 @@ export default function AIPromptPanel({
     }
   };
 
-  // Handle batch animation generation (multiple animations across the video)
+  // Handle batch animation generation — uses storyboard preview if available
   const handleBatchAnimationsWorkflow = async (count: number) => {
-    if (!onGenerateBatchAnimations) return;
+    const previewFn = onPreviewBatchAnimations ?? onGenerateBatchAnimations;
+    if (!previewFn) return;
 
     setIsProcessing(true);
     setProcessingStatus('Planning animations...');
@@ -1892,31 +2464,56 @@ export default function AIPromptPanel({
     try {
       setChatHistory(prev => [...prev, {
         type: 'assistant',
-        text: `🎬 Generating ${count} animations across your video...\n\n1. Transcribing video to understand content\n2. Planning strategic animation placements\n3. Generating ${count} unique animations\n4. Adding to timeline at optimal positions\n\nThis may take a while (generating ${count} animations)...`,
+        text: (() => {
+          const contextParts = [
+            timelineSummary.hasCaptions ? `${timelineSummary.captionCount} captions` : '',
+            timelineSummary.hasAnimations ? `${timelineSummary.animationCount} existing animations` : '',
+          ].filter(Boolean).join(', ');
+          const alreadyHas = contextParts ? ` (already has ${contextParts})` : '';
+          return `🎬 Generating ${count} animations for your ${formatTimeShort(timelineSummary.videoDuration)} video${alreadyHas}...\n\n1. Transcribing video to understand content\n2. Planning strategic animation placements\n3. Generating ${count} unique animations\n\nThis may take a while...`;
+        })(),
         isProcessingGifs: true,
       }]);
 
-      const result = await onGenerateBatchAnimations(count);
+      const result = await previewFn(count);
 
-      // Build summary of generated animations
-      const animationList = result.animations
-        .map((a, i) => `${i + 1}. ${a.type} at ${formatTimeShort(a.startTime)}: "${a.title}" (${a.duration.toFixed(1)}s)`)
-        .join('\n');
+      if (onPreviewBatchAnimations) {
+        // Storyboard mode: show thumbnails for approval
+        setChatHistory(prev => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.isProcessingGifs) {
+            updated[lastIdx] = {
+              ...updated[lastIdx],
+              text: `Generated ${result.animations.length} animations. Preview below — apply to timeline?`,
+              isProcessingGifs: false,
+              pendingBatchAnimations: result.animations,
+            };
+          }
+          return updated;
+        });
+      } else {
+        // Legacy mode (no preview prop): auto-apply
+        const animationList = result.animations
+          .map((a, i) => `${i + 1}. ${a.type} at ${formatTimeShort(a.startTime)}: "${a.title}" (${a.duration.toFixed(1)}s)`)
+          .join('\n');
+        const addedClipIds = (result as { addedClipIds?: string[] }).addedClipIds ?? [];
 
-      // Update the last message to show completion
-      setChatHistory(prev => {
-        const updated = [...prev];
-        const lastIdx = updated.length - 1;
-        if (updated[lastIdx]?.isProcessingGifs) {
-          updated[lastIdx] = {
-            ...updated[lastIdx],
-            text: `✅ Generated ${result.animations.length} animations!\n\nAnimations added to your timeline:\n${animationList}\n\nVideo duration: ${result.videoDuration.toFixed(1)}s\n\nYou can edit individual animations by selecting them on the timeline.`,
-            isProcessingGifs: false,
-            applied: true,
-          };
-        }
-        return updated;
-      });
+        setChatHistory(prev => {
+          const updated = [...prev];
+          const lastIdx = updated.length - 1;
+          if (updated[lastIdx]?.isProcessingGifs) {
+            updated[lastIdx] = {
+              ...updated[lastIdx],
+              text: `✅ Generated ${result.animations.length} animations!\n\nAnimations added to your timeline:\n${animationList}\n\nVideo duration: ${result.videoDuration.toFixed(1)}s\n\nYou can edit individual animations by selecting them on the timeline.`,
+              isProcessingGifs: false,
+              applied: true,
+              undoData: addedClipIds.length > 0 ? { workflowType: 'batch-animations', addedClipIds } : undefined,
+            };
+          }
+          return updated;
+        });
+      }
 
     } catch (error) {
       console.error('Batch animations error:', error);
@@ -1930,6 +2527,55 @@ export default function AIPromptPanel({
     }
   };
 
+  // Apply storyboard-previewed animations to the timeline
+  const handleApplyStoryboardAnimations = async (idx: number) => {
+    const msg = chatHistory[idx];
+    if (!msg.pendingBatchAnimations || !onApplyBatchAnimations) return;
+    setIsProcessing(true);
+    try {
+      const result = await onApplyBatchAnimations(msg.pendingBatchAnimations);
+      setChatHistory(prev => prev.map((m, i) => {
+        if (i !== idx) return m;
+        const animList = msg.pendingBatchAnimations!
+          .map((a, j) => `${j + 1}. ${a.type} at ${formatTimeShort(a.startTime)}: "${a.title}" (${a.duration.toFixed(1)}s)`)
+          .join('\n');
+        return {
+          ...m,
+          text: `✅ Added ${msg.pendingBatchAnimations!.length} animations to timeline!\n\n${animList}`,
+          batchAnimationsApplied: true,
+          applied: true,
+          undoData: result.addedClipIds.length > 0
+            ? { workflowType: 'batch-animations' as const, addedClipIds: result.addedClipIds }
+            : undefined,
+        };
+      }));
+    } catch (error) {
+      console.error('Apply animations error:', error);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Cancel storyboard preview (dismiss without adding to timeline)
+  const handleCancelStoryboardAnimations = (idx: number) => {
+    setChatHistory(prev => prev.map((m, i) =>
+      i === idx ? { ...m, batchAnimationsApplied: true, text: 'Animation preview cancelled.' } : m
+    ));
+  };
+
+  // Undo an applied workflow (removes added clips)
+  const handleUndo = async (idx: number) => {
+    const msg = chatHistory[idx];
+    if (!msg.undoData || msg.undone) return;
+    setIsProcessing(true);
+    try {
+      await onUndoWorkflow?.(msg.undoData);
+      setChatHistory(prev => prev.map((m, i) => i === idx ? { ...m, undone: true } : m));
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   // Handle extract audio workflow (separates audio to A1 track, mutes video)
   const handleExtractAudioWorkflow = async () => {
     if (!onExtractAudio) return;
@@ -1940,7 +2586,7 @@ export default function AIPromptPanel({
     try {
       setChatHistory(prev => [...prev, {
         type: 'assistant',
-        text: '🎵 Extracting audio from your video...\n\n1. Extracting audio track to separate file\n2. Creating muted version of video\n3. Adding audio to A1 track\n4. Replacing video with muted version\n\nThis will give you independent control over video and audio.',
+        text: `🎵 Extracting audio from your ${formatTimeShort(timelineSummary.videoDuration)} video...\n\n1. Extracting audio track to separate file\n2. Creating muted version of video\n3. Adding audio to A1 track\n4. Replacing video with muted version\n\nThis will give you independent control over video and audio.`,
         isProcessingGifs: true,
       }]);
 
@@ -1956,6 +2602,12 @@ export default function AIPromptPanel({
             text: `✅ Audio extracted successfully!\n\n🎵 Audio: "${result.audioAsset.filename}" (${result.audioAsset.duration.toFixed(1)}s) → Added to A1 track\n🎬 Video: "${result.mutedVideoAsset.filename}" → Replaced original (now muted)\n\nYou can now edit video and audio independently!`,
             isProcessingGifs: false,
             applied: true,
+            undoData: result.addedA1ClipId ? {
+              workflowType: 'extract-audio',
+              addedClipIds: [result.addedA1ClipId],
+              modifiedV1ClipId: result.modifiedV1ClipId,
+              originalV1AssetId: result.originalV1AssetId,
+            } : undefined,
           };
         }
         return updated;
@@ -1970,6 +2622,205 @@ export default function AIPromptPanel({
     } finally {
       setIsProcessing(false);
       setProcessingStatus('');
+    }
+  };
+
+  // Run a front-end audit of the timeline and return prioritised results
+  const runAudit = (): AuditResult[] => {
+    const s = timelineSummary;
+    const results: AuditResult[] = [];
+
+    if (s.isEmptyTimeline) {
+      results.push({ severity: 'warning', message: 'Timeline is empty — no clips or edits added yet' });
+      return results;
+    }
+
+    // Warnings
+    if (!s.hasCaptions) {
+      results.push({
+        severity: 'warning',
+        message: '85% of viewers watch without sound — no captions yet',
+        fixLabel: 'Add Captions',
+        fixWorkflow: 'captions',
+      });
+    }
+
+    if (!s.hasAnimations && !s.hasGifs && !s.hasBroll) {
+      results.push({
+        severity: 'info',
+        message: 'No visual overlays — animations or GIFs help retain viewer attention',
+        fixLabel: 'Add 3 Animations',
+        fixWorkflow: 'batch-animations',
+      });
+    } else {
+      if (!s.hasAnimations && (s.hasGifs || s.hasBroll)) {
+        results.push({
+          severity: 'info',
+          message: 'No animations on V2 — motion graphics can boost production value',
+          fixLabel: 'Add Animations',
+          fixWorkflow: 'batch-animations',
+        });
+      }
+      if (!s.hasGifs && !s.hasBroll && s.hasAnimations) {
+        results.push({
+          severity: 'info',
+          message: 'No GIF overlays or B-roll — visual variety improves watch time',
+          fixLabel: 'Add GIFs',
+          fixWorkflow: 'auto-gif',
+        });
+      }
+    }
+
+    if (!s.hasAudioTrack) {
+      results.push({
+        severity: 'info',
+        message: 'Audio is embedded in the video track — extract to A1 for independent mixing',
+        fixLabel: 'Extract Audio',
+        fixWorkflow: 'extract-audio',
+      });
+    }
+
+    // Positives
+    if (s.hasCaptions) {
+      results.push({ severity: 'good', message: `${s.captionCount} captions on T1 — great for accessibility and SEO` });
+    }
+    if (s.hasAnimations) {
+      results.push({ severity: 'good', message: `${s.animationCount} animation${s.animationCount !== 1 ? 's' : ''} on V2 — strong visual engagement` });
+    }
+    if (s.hasGifs || s.hasBroll) {
+      const count = s.gifCount + s.brollCount;
+      results.push({ severity: 'good', message: `${count} visual overlay${count !== 1 ? 's' : ''} adding variety` });
+    }
+    if (s.hasAudioTrack) {
+      results.push({ severity: 'good', message: 'Audio extracted to A1 — full mixing control' });
+    }
+
+    // Duration
+    if (s.videoDuration > 0 && s.videoDuration < 30) {
+      results.push({ severity: 'info', message: `Video is only ${formatTimeShort(s.videoDuration)} — very short, make sure this is intentional` });
+    } else if (s.videoDuration >= 480) {
+      results.push({ severity: 'good', message: `${formatTimeShort(s.videoDuration)} — over 8 min, eligible for YouTube mid-roll ads` });
+    } else if (s.videoDuration > 0) {
+      results.push({ severity: 'good', message: `${formatTimeShort(s.videoDuration)} — solid length for engagement` });
+    }
+
+    return results;
+  };
+
+  // Trigger a fix workflow from an audit result button
+  const handleAuditFix = (fixWorkflow: NonNullable<AuditResult['fixWorkflow']>) => {
+    switch (fixWorkflow) {
+      case 'captions': handleCaptionWorkflow(); break;
+      case 'batch-animations': handleBatchAnimationsWorkflow(3); break;
+      case 'auto-gif': handleAutoGifWorkflow(); break;
+      case 'extract-audio': handleExtractAudioWorkflow(); break;
+    }
+  };
+
+  const executeRecipe = async (recipe: Recipe) => {
+    if (isProcessing || !hasVideo) return;
+    setShowRecipes(false);
+    setIsProcessing(true);
+
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: `⚡ **${recipe.label}** — Step 1/${recipe.steps.length}: ${recipe.steps[0].label}`,
+      isProcessingGifs: true,
+    }]);
+
+    const completed: string[] = [];
+
+    for (let i = 0; i < recipe.steps.length; i++) {
+      const step = recipe.steps[i];
+
+      setChatHistory(prev => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          text: `⚡ **${recipe.label}** — Step ${i + 1}/${recipe.steps.length}: ${step.label}${completed.length > 0 ? '\n\n' + completed.join('\n') : ''}`,
+        };
+        return updated;
+      });
+
+      try {
+        switch (step.workflowType) {
+          case 'dead-air': {
+            const r = await onRemoveDeadAir?.();
+            completed.push(`✅ Removed ${r?.removedDuration?.toFixed(1) ?? '?'}s of dead air`);
+            break;
+          }
+          case 'captions': {
+            await onTranscribeAndAddCaptions?.();
+            completed.push('✅ Captions added');
+            break;
+          }
+          case 'chapter-cuts': {
+            const r = await onChapterCuts?.();
+            completed.push(`✅ Split into ${r?.chapters?.length ?? '?'} chapters`);
+            break;
+          }
+          case 'batch-animations': {
+            const r = await onGenerateBatchAnimations?.(step.count ?? 3);
+            completed.push(`✅ Added ${r?.animations?.length ?? '?'} animations`);
+            break;
+          }
+          case 'auto-gif': {
+            await onExtractKeywordsAndAddGifs?.();
+            completed.push('✅ GIF overlays added');
+            break;
+          }
+          case 'extract-audio': {
+            await onExtractAudio?.();
+            completed.push('✅ Audio extracted to A1');
+            break;
+          }
+        }
+      } catch {
+        completed.push(`❌ ${step.label.replace('...', '')} failed`);
+        break;
+      }
+    }
+
+    setChatHistory(prev => {
+      const updated = [...prev];
+      updated[updated.length - 1] = {
+        ...updated[updated.length - 1],
+        text: `✅ **${recipe.label}** complete!\n\n${completed.join('\n')}`,
+        isProcessingGifs: false,
+        applied: true,
+      };
+      return updated;
+    });
+
+    setIsProcessing(false);
+  };
+
+  const getWorkflowPreview = (workflow: WorkflowType): { description: string; details: string[] } => {
+    const dur = formatTimeShort(timelineSummary.videoDuration);
+    switch (workflow) {
+      case 'dead-air':
+        return {
+          description: 'Remove silence from your video',
+          details: [
+            `Scans ${dur} of audio for pauses ≥ 0.4s below -26 dB`,
+            'Cuts each silent segment and re-concatenates the video',
+            'Replaces your source file in-place — this cannot be undone',
+            timelineSummary.hasCaptions
+              ? `Note: ${timelineSummary.captionCount} caption clips may need re-syncing after`
+              : 'No captions to worry about',
+          ],
+        };
+      case 'extract-audio':
+        return {
+          description: 'Separate audio from video onto the A1 track',
+          details: [
+            'Mutes the V1 video clip',
+            'Creates a new audio-only asset on the A1 track',
+            'Original video file is not modified',
+          ],
+        };
+      default:
+        return { description: 'Run this operation', details: [] };
     }
   };
 
@@ -2043,7 +2894,16 @@ export default function AIPromptPanel({
       hasAiAnimationsOnTimeline,
       selectedClipIsAiAnimation,
       selectedAiAnimationAssetId: selectedClipIsAiAnimation ? selectedClipAsset?.id : undefined,
+      timelineSummary,
     };
+
+    // Check for multiple intents before single-workflow dispatch
+    const multiSteps = detectMultipleIntents(userMessage);
+    if (multiSteps && multiSteps.length >= 2) {
+      const dynamicRecipe: Recipe = { id: 'dynamic', label: 'Custom Edit', description: '', steps: multiSteps };
+      await executeRecipe(dynamicRecipe);
+      return;
+    }
 
     const workflow = determineWorkflow(directorContext);
     console.log('[Director] Determined workflow:', workflow);
@@ -2072,6 +2932,18 @@ export default function AIPromptPanel({
     // ===========================================
     // Execute the determined workflow
     // ===========================================
+
+    // Gate destructive/irreversible workflows with a confirm step
+    const CONFIRM_WORKFLOWS: WorkflowType[] = ['dead-air', 'extract-audio'];
+    if (CONFIRM_WORKFLOWS.includes(workflow) && hasVideo) {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: '',
+        confirmWorkflow: workflow,
+        confirmData: getWorkflowPreview(workflow),
+      }]);
+      return;
+    }
 
     // Edit existing animation (Remotion)
     // Priority for asset ID:
@@ -2173,6 +3045,26 @@ export default function AIPromptPanel({
       return;
     }
 
+    // Audit / critic — instant, synchronous, no server call
+    if (workflow === 'audit') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first so I can audit your project.',
+        }]);
+        return;
+      }
+      const auditResults = runAudit();
+      const issueCount = auditResults.filter(r => r.severity !== 'good').length;
+      const goodCount = auditResults.filter(r => r.severity === 'good').length;
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `🔍 Video Audit — ${issueCount} suggestion${issueCount !== 1 ? 's' : ''}, ${goodCount} ${goodCount !== 1 ? 'things' : 'thing'} looking good`,
+        auditResults,
+      }]);
+      return;
+    }
+
     // Transcript animation (kinetic typography)
     if (workflow === 'transcript-animation') {
       if (!hasVideo) {
@@ -2226,6 +3118,71 @@ export default function AIPromptPanel({
       return;
     }
 
+    // Platform preset (instant — pre-built FFmpeg command)
+    if (workflow === 'platform-preset') {
+      const lower = userMessage.toLowerCase();
+      const platform = PLATFORM_PRESETS.find(p => p.keywords.some(k => lower.includes(k))) ?? PLATFORM_PRESETS[0];
+      handlePlatformPresetWorkflow(platform);
+      return;
+    }
+
+    // Caption polish — filler word removal (instant, no AI needed)
+    if (workflow === 'caption-polish') {
+      handleCaptionPolishWorkflow();
+      return;
+    }
+
+    // Audio clean (instant — no AI needed)
+    if (workflow === 'audio-clean') {
+      handleAudioCleanWorkflow();
+      return;
+    }
+
+    // Audio normalize (instant — no AI needed)
+    if (workflow === 'audio-normalize') {
+      handleAudioNormalizeWorkflow();
+      return;
+    }
+
+    // Scene detect
+    if (workflow === 'scene-detect') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first. I\'ll then scan it for scene changes.',
+        }]);
+        return;
+      }
+      await handleSceneDetectWorkflow();
+      return;
+    }
+
+    // Filler word audio muting
+    if (workflow === 'filler-cut') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first, then add captions so I can locate filler words.',
+        }]);
+        return;
+      }
+      await handleFillerCutWorkflow();
+      return;
+    }
+
+    // Section resequencing
+    if (workflow === 'resequence') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video and add captions first so I can identify sections.',
+        }]);
+        return;
+      }
+      await handleResequenceWorkflow(userMessage);
+      return;
+    }
+
     // FFmpeg video edit (default for video manipulation)
     setIsProcessing(true);
     setProcessingStatus('Starting AI...');
@@ -2276,6 +3233,89 @@ export default function AIPromptPanel({
       setIsProcessing(false);
       setProcessingStatus('');
     }
+  };
+
+  const FILLER_WORDS = new Set([
+    'um', 'uh', 'hmm', 'hm', 'mhm', 'uh-huh',
+    'like', 'basically', 'literally', 'actually',
+    'right', 'okay', 'ok', 'so', 'well',
+    'you', 'know', 'mean', // catches "you know" / "i mean" per-word
+  ]);
+
+  const handleCaptionPolishWorkflow = () => {
+    const t1Clips = clips.filter(c => c.trackId === 'T1');
+    if (!captionData || t1Clips.length === 0 || !onUpdateCaptionWords) {
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: 'No captions found. Add captions first, then I can remove filler words.',
+      }]);
+      return;
+    }
+
+    let totalRemoved = 0;
+    for (const clip of t1Clips) {
+      const cd = captionData[clip.id];
+      if (!cd?.words?.length) continue;
+      const filtered = cd.words.filter(
+        w => !FILLER_WORDS.has(w.text.toLowerCase().replace(/[.,!?'"]/g, ''))
+      );
+      const removed = cd.words.length - filtered.length;
+      if (removed > 0) {
+        onUpdateCaptionWords(clip.id, filtered);
+        totalRemoved += removed;
+      }
+    }
+
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: totalRemoved === 0
+        ? 'Your captions look clean — no common filler words (um, uh, like, basically, etc.) found.'
+        : `Removed ${totalRemoved} filler word${totalRemoved !== 1 ? 's' : ''} from your captions (um, uh, like, basically, literally, etc.).`,
+    }]);
+  };
+
+  const handlePlatformPresetWorkflow = (platform: PlatformPreset) => {
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: `Formatting for ${platform.label} — ${platform.width}×${platform.height} (${platform.aspectRatio}), ${platform.lufs} LUFS. Click Apply to process.`,
+      command: platform.command,
+      applied: false,
+    }]);
+    setShowPlatforms(false);
+  };
+
+  const handleAudioCleanWorkflow = () => {
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: 'Removing background noise using FFT denoising + high-pass filter (cuts rumble below 80 Hz). Click Apply to process.',
+      command: 'ffmpeg -i input.mp4 -af "highpass=f=80,afftdn=nf=-25" output.mp4',
+      applied: false,
+    }]);
+  };
+
+  const handleAudioNormalizeWorkflow = () => {
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: 'Normalizing loudness to −16 LUFS (YouTube standard, EBU R128). Click Apply to process.',
+      command: 'ffmpeg -i input.mp4 -af "loudnorm=I=-16:TP=-1.5:LRA=11" output.mp4',
+      applied: false,
+    }]);
+  };
+
+  const handleConfirmWorkflow = async (messageIndex: number, workflow: string) => {
+    setChatHistory(prev => prev.map((msg, idx) =>
+      idx === messageIndex ? { ...msg, confirmed: true } : msg
+    ));
+    switch (workflow) {
+      case 'dead-air':    await handleDeadAirWorkflow(); break;
+      case 'extract-audio': await handleExtractAudioWorkflow(); break;
+    }
+  };
+
+  const handleDeclineWorkflow = (messageIndex: number) => {
+    setChatHistory(prev => prev.map((msg, idx) =>
+      idx === messageIndex ? { ...msg, declined: true } : msg
+    ));
   };
 
   const handleApplyEdit = async (command: string, messageIndex: number) => {
@@ -2403,7 +3443,15 @@ export default function AIPromptPanel({
           chatHistory.map((message, idx) => (
             <div key={idx} className="space-y-2">
               {message.type === 'user' ? (
-                <div className="flex justify-end">
+                <div className="flex justify-end items-start gap-1.5 group/msg">
+                  <button
+                    type="button"
+                    onClick={() => savePrompt(message.text)}
+                    title={savedPrompts.includes(message.text.replace(/^\[[\d:]+\s*-\s*[\d:]+\]\s*/, '').replace(/^(@\S+\s*)+/, '').trim()) ? 'Already saved' : 'Save prompt'}
+                    className="opacity-0 group-hover/msg:opacity-100 transition-opacity mt-1.5 p-1 rounded text-zinc-600 hover:text-amber-400"
+                  >
+                    <Star className="w-3 h-3" />
+                  </button>
                   <div className="bg-gradient-to-r from-orange-500 to-amber-500 rounded-lg px-3 py-2 max-w-[85%]">
                     <p className="text-sm text-white">{message.text}</p>
                   </div>
@@ -2484,6 +3532,203 @@ export default function AIPromptPanel({
                       </div>
                     )}
 
+                    {/* Storyboard preview for batch animations */}
+                    {message.pendingBatchAnimations && !message.batchAnimationsApplied && (
+                      <div className="mt-3 space-y-3">
+                        <div className="flex gap-2 flex-wrap">
+                          {message.pendingBatchAnimations.map((anim, i) => (
+                            <div key={i} className="w-24 rounded overflow-hidden border border-zinc-700 bg-zinc-800">
+                              {anim.thumbnailUrl
+                                ? <img src={anim.thumbnailUrl} className="w-full aspect-video object-cover" />
+                                : <div className="w-full aspect-video bg-zinc-700 flex items-center justify-center text-xs text-zinc-500">No preview</div>
+                              }
+                              <div className="p-1 text-[10px] text-zinc-400 truncate" title={anim.title}>{anim.title}</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => handleApplyStoryboardAnimations(idx)}
+                            disabled={isProcessing}
+                            className="px-3 py-1.5 text-xs bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded-lg transition-colors"
+                          >
+                            ✅ Apply to Timeline
+                          </button>
+                          <button
+                            onClick={() => handleCancelStoryboardAnimations(idx)}
+                            disabled={isProcessing}
+                            className="px-3 py-1.5 text-xs bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 text-white rounded-lg transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Audit results */}
+                    {message.auditResults && message.auditResults.length > 0 && (
+                      <div className="mt-3 space-y-1.5">
+                        {message.auditResults.map((result, i) => (
+                          <div
+                            key={i}
+                            className={`flex items-start gap-2 p-2 rounded-lg ${
+                              result.severity === 'warning' ? 'bg-orange-500/10 border border-orange-500/20' :
+                              result.severity === 'good'    ? 'bg-emerald-500/10 border border-emerald-500/20' :
+                                                              'bg-zinc-700/40 border border-zinc-700/60'
+                            }`}
+                          >
+                            <span className="text-sm shrink-0 mt-0.5">
+                              {result.severity === 'warning' ? '⚠️' : result.severity === 'good' ? '✅' : 'ℹ️'}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs text-zinc-300 leading-relaxed">{result.message}</p>
+                              {result.fixLabel && result.fixWorkflow && (
+                                <button
+                                  onClick={() => handleAuditFix(result.fixWorkflow!)}
+                                  disabled={isProcessing}
+                                  className="mt-1 text-[11px] text-orange-400 hover:text-orange-300 disabled:opacity-40 transition-colors font-medium"
+                                >
+                                  → {result.fixLabel}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Confirm card for destructive workflows */}
+                    {message.confirmWorkflow && !message.confirmed && !message.declined && (
+                      <div className="mt-3 p-3 bg-zinc-800/80 border border-zinc-700/60 rounded-xl space-y-2">
+                        <p className="text-xs font-semibold text-zinc-200">{message.confirmData?.description}</p>
+                        <ul className="space-y-1">
+                          {message.confirmData?.details.map((d, i) => (
+                            <li key={i} className="text-[11px] text-zinc-400 leading-relaxed">· {d}</li>
+                          ))}
+                        </ul>
+                        <div className="flex gap-2 pt-1">
+                          <button
+                            onClick={() => handleConfirmWorkflow(idx, message.confirmWorkflow!)}
+                            disabled={isProcessing}
+                            className="flex-1 py-1.5 rounded-lg bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-xs font-semibold text-white transition-colors"
+                          >
+                            Proceed
+                          </button>
+                          <button
+                            onClick={() => handleDeclineWorkflow(idx)}
+                            disabled={isProcessing}
+                            className="px-4 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 text-xs font-medium text-zinc-300 transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {message.declined && message.confirmWorkflow && (
+                      <p className="mt-2 text-[11px] text-zinc-600 italic">Cancelled.</p>
+                    )}
+
+                    {/* Scene detect result card */}
+                    {message.sceneDetectResult && !message.sceneDetectResult.applied && (
+                      <div className="mt-3 p-3 bg-zinc-800/80 border border-zinc-700/60 rounded-xl space-y-2">
+                        <p className="text-xs font-semibold text-zinc-200">Scene changes detected</p>
+                        <ul className="space-y-0.5 max-h-40 overflow-y-auto">
+                          {message.sceneDetectResult.scenes.map((s, i) => {
+                            const mins = Math.floor(s.timestamp / 60);
+                            const secs = (s.timestamp % 60).toFixed(1);
+                            return (
+                              <li key={i} className="text-[11px] text-zinc-400 font-mono">
+                                · {mins}:{secs.toString().padStart(4, '0')}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                        <button
+                          onClick={async () => {
+                            if (!onApplySceneCuts) return;
+                            setIsProcessing(true);
+                            try {
+                              const timestamps = message.sceneDetectResult!.scenes.map(s => s.timestamp);
+                              const result = await onApplySceneCuts(timestamps);
+                              setChatHistory(prev => prev.map((m, i) =>
+                                i === idx
+                                  ? { ...m, sceneDetectResult: { ...m.sceneDetectResult!, applied: true },
+                                      text: `✅ Applied ${result.cutsApplied} cut${result.cutsApplied !== 1 ? 's' : ''} at scene changes.` }
+                                  : m
+                              ));
+                            } catch (err) {
+                              console.error('Apply scene cuts failed:', err);
+                            } finally {
+                              setIsProcessing(false);
+                            }
+                          }}
+                          disabled={isProcessing}
+                          className="w-full py-1.5 rounded-lg bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-xs font-semibold text-white transition-colors"
+                        >
+                          Cut at {message.sceneDetectResult.scenes.length} scene{message.sceneDetectResult.scenes.length !== 1 ? 's' : ''}
+                        </button>
+                      </div>
+                    )}
+                    {message.sceneDetectResult?.applied && (
+                      <div className="mt-2 flex items-center gap-2 px-3 py-2 bg-emerald-500/20 rounded-lg text-xs font-medium text-emerald-400">
+                        <CheckCircle className="w-3 h-3" />
+                        Scene cuts applied to timeline
+                      </div>
+                    )}
+
+                    {/* Resequence result card */}
+                    {message.resequenceResult && !message.resequenceResult.applied && (
+                      <div className="mt-3 p-3 bg-zinc-800/80 border border-zinc-700/60 rounded-xl space-y-2">
+                        <p className="text-xs font-semibold text-zinc-200">Proposed resequencing</p>
+                        <ul className="space-y-1">
+                          {message.resequenceResult.swaps.map((s, i) => (
+                            <li key={i} className="text-[11px] text-zinc-400 leading-relaxed">
+                              · Move <span className="text-zinc-200">"{s.from.label}"</span> ({s.from.startTime.toFixed(1)}s – {s.from.endTime.toFixed(1)}s) before <span className="text-zinc-200">"{s.to.label}"</span> ({s.to.startTime.toFixed(1)}s)
+                            </li>
+                          ))}
+                        </ul>
+                        <div className="flex gap-2 pt-1">
+                          <button
+                            onClick={async () => {
+                              if (!onApplyResequence) return;
+                              setIsProcessing(true);
+                              try {
+                                await onApplyResequence(message.resequenceResult!.swaps);
+                                setChatHistory(prev => prev.map((m, i) =>
+                                  i === idx
+                                    ? { ...m, resequenceResult: { ...m.resequenceResult!, applied: true } }
+                                    : m
+                                ));
+                              } catch (err) {
+                                console.error('Apply resequence failed:', err);
+                              } finally {
+                                setIsProcessing(false);
+                              }
+                            }}
+                            disabled={isProcessing}
+                            className="flex-1 py-1.5 rounded-lg bg-orange-500 hover:bg-orange-400 disabled:opacity-50 text-xs font-semibold text-white transition-colors"
+                          >
+                            Apply resequence
+                          </button>
+                          <button
+                            onClick={() => setChatHistory(prev => prev.map((m, i) =>
+                              i === idx ? { ...m, resequenceResult: { ...m.resequenceResult!, applied: true } } : m
+                            ))}
+                            disabled={isProcessing}
+                            className="px-4 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 text-xs font-medium text-zinc-300 transition-colors"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    {message.resequenceResult?.applied && (
+                      <div className="mt-2 flex items-center gap-2 px-3 py-2 bg-emerald-500/20 rounded-lg text-xs font-medium text-emerald-400">
+                        <CheckCircle className="w-3 h-3" />
+                        Sections resequenced on timeline
+                      </div>
+                    )}
+
                     {/* Success indicator for GIF/Caption/B-roll/Dead air/Animation edit workflow */}
                     {message.applied && !message.command && !message.animationAssetId && (
                       <div className="mt-2 flex items-center gap-2 px-3 py-2 bg-emerald-500/20 rounded-lg text-xs font-medium text-emerald-400">
@@ -2492,8 +3737,22 @@ export default function AIPromptPanel({
                          message.isBrollWorkflow ? 'B-roll images added to V3 track' :
                          message.isDeadAirWorkflow ? 'Dead air removed from timeline' :
                          message.isInPlaceEdit ? 'Edit added to animation' :
-                         'GIFs added to timeline'}
+                         'Applied to timeline'}
                       </div>
+                    )}
+
+                    {/* Undo button for reversible workflows */}
+                    {message.applied && message.undoData && !message.undone && onUndoWorkflow && (
+                      <button
+                        onClick={() => handleUndo(idx)}
+                        disabled={isProcessing}
+                        className="mt-1 text-xs text-zinc-500 hover:text-red-400 disabled:opacity-40 transition-colors"
+                      >
+                        ↩ Undo
+                      </button>
+                    )}
+                    {message.undone && (
+                      <span className="mt-1 block text-xs text-zinc-600 italic">↩ Undone</span>
                     )}
 
                     {/* Animation created - offer to edit in new tab */}
@@ -2562,6 +3821,31 @@ export default function AIPromptPanel({
         {/* Scroll anchor */}
         <div ref={chatEndRef} />
       </div>
+
+      {/* Timeline awareness bar — live project state */}
+      {hasVideo && (
+        <div className="flex items-center gap-2.5 px-3 py-1.5 border-t border-zinc-800/60 bg-zinc-900/40 shrink-0 flex-wrap">
+          <span className="text-[11px] text-zinc-500 font-mono">{formatTimeShort(timelineSummary.videoDuration)}</span>
+          {timelineSummary.hasCaptions && (
+            <span className="text-[11px] text-blue-400/70">{timelineSummary.captionCount} captions</span>
+          )}
+          {timelineSummary.hasAnimations && (
+            <span className="text-[11px] text-purple-400/70">{timelineSummary.animationCount} animations</span>
+          )}
+          {timelineSummary.hasGifs && (
+            <span className="text-[11px] text-green-400/70">{timelineSummary.gifCount} GIFs</span>
+          )}
+          {timelineSummary.hasBroll && (
+            <span className="text-[11px] text-amber-400/70">{timelineSummary.brollCount} B-roll</span>
+          )}
+          {timelineSummary.hasAudioTrack && (
+            <span className="text-[11px] text-yellow-400/70">A1 audio</span>
+          )}
+          {timelineSummary.isEmptyTimeline && (
+            <span className="text-[11px] text-zinc-600 italic">video only · no edits yet</span>
+          )}
+        </div>
+      )}
 
       {/* Caption Options UI */}
       {showCaptionOptions && (
@@ -2647,7 +3931,37 @@ export default function AIPromptPanel({
 
           {/* Popover Menu */}
           {showQuickActions && (
-            <div className="absolute bottom-full left-0 right-0 mb-2 p-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl z-10 animate-in fade-in slide-in-from-bottom-2 duration-200">
+            <div className="absolute bottom-full left-0 right-0 mb-2 p-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl z-10 animate-in fade-in slide-in-from-bottom-2 duration-200 max-h-80 overflow-y-auto">
+              {savedPrompts.length > 0 && (
+                <div className="mb-2">
+                  <div className="flex items-center gap-1 px-1 mb-1">
+                    <Star className="w-3 h-3 text-amber-400" />
+                    <span className="text-[11px] font-semibold text-zinc-400 uppercase tracking-wide">Saved</span>
+                  </div>
+                  <div className="space-y-1 mb-2">
+                    {savedPrompts.map((p) => (
+                      <div key={p} className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => { setPrompt(p); setShowQuickActions(false); }}
+                          className="flex-1 text-left px-2.5 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 rounded-lg text-xs text-amber-200 transition-colors truncate"
+                        >
+                          {p}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removePrompt(p)}
+                          className="p-1 text-zinc-600 hover:text-red-400 transition-colors shrink-0"
+                          title="Remove"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="border-t border-zinc-700/60 mb-2" />
+                </div>
+              )}
               <div className="grid grid-cols-2 gap-1.5">
                 {suggestions.map((suggestion, idx) => (
                   <button
@@ -2661,6 +3975,82 @@ export default function AIPromptPanel({
                   >
                     <suggestion.icon className="w-4 h-4 text-zinc-400 group-hover:text-orange-400 transition-colors flex-shrink-0" />
                     <span className="text-zinc-300 leading-tight">{suggestion.text}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Recipes Popover */}
+        <div className="relative mb-3" ref={recipesRef}>
+          <button
+            type="button"
+            onClick={() => { setShowRecipes(v => !v); setShowQuickActions(false); }}
+            disabled={!hasVideo || isProcessing}
+            className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              showRecipes
+                ? 'bg-orange-500/20 text-orange-400 ring-1 ring-orange-500/50'
+                : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed'
+            }`}
+          >
+            <Zap className="w-4 h-4" />
+            Recipes
+            {showRecipes && <X className="w-3 h-3 ml-auto" />}
+          </button>
+
+          {showRecipes && (
+            <div className="absolute bottom-full left-0 right-0 mb-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl z-10 animate-in fade-in slide-in-from-bottom-2 duration-200 p-3">
+              <div className="text-xs font-semibold text-zinc-400 mb-2 px-1">⚡ Run a full editing pipeline</div>
+              <div className="space-y-1.5 max-h-80 overflow-y-auto">
+                {RECIPES.map(recipe => (
+                  <button
+                    key={recipe.id}
+                    type="button"
+                    onClick={() => executeRecipe(recipe)}
+                    className="w-full text-left p-2.5 rounded-lg hover:bg-zinc-700 transition-colors group"
+                  >
+                    <div className="text-sm font-medium text-zinc-200 group-hover:text-orange-400 transition-colors">{recipe.label}</div>
+                    <div className="text-xs text-zinc-500 mt-0.5">{recipe.description}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Platforms Popover */}
+        <div className="relative mb-3" ref={platformsRef}>
+          <button
+            type="button"
+            onClick={() => { setShowPlatforms(v => !v); setShowQuickActions(false); setShowRecipes(false); }}
+            disabled={!hasVideo || isProcessing}
+            className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+              showPlatforms
+                ? 'bg-blue-500/20 text-blue-400 ring-1 ring-blue-500/50'
+                : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-300 disabled:opacity-50 disabled:cursor-not-allowed'
+            }`}
+          >
+            <Globe className="w-4 h-4" />
+            Platform Export
+            {showPlatforms && <X className="w-3 h-3 ml-auto" />}
+          </button>
+          {showPlatforms && (
+            <div className="absolute bottom-full left-0 right-0 mb-2 bg-zinc-800 border border-zinc-700 rounded-xl shadow-xl z-10 animate-in fade-in slide-in-from-bottom-2 duration-200 p-3">
+              <div className="text-xs font-semibold text-zinc-400 mb-2 px-1">🌐 Re-encode for platform</div>
+              <div className="space-y-1.5">
+                {PLATFORM_PRESETS.map(preset => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => handlePlatformPresetWorkflow(preset)}
+                    className="w-full text-left p-2.5 rounded-lg hover:bg-zinc-700 transition-colors group flex items-center gap-3"
+                  >
+                    <span className="text-base w-5 text-center shrink-0">{preset.emoji}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium text-zinc-200 group-hover:text-blue-400 transition-colors">{preset.label}</div>
+                      <div className="text-xs text-zinc-500">{preset.width}×{preset.height} · {preset.aspectRatio} · {preset.lufs} LUFS</div>
+                    </div>
                   </button>
                 ))}
               </div>

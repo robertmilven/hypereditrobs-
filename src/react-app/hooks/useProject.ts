@@ -444,6 +444,17 @@ export function useProject() {
     });
   }, []);
 
+  // Undo a batch workflow by removing the clips it added
+  const undoWorkflowClips = useCallback((clipIds: string[]): void => {
+    const idSet = new Set(clipIds);
+    setClips(prev => prev.filter(c => !idSet.has(c.id)));
+    setCaptionData(prev => {
+      const next = { ...prev };
+      clipIds.forEach(id => delete next[id]);
+      return next;
+    });
+  }, []);
+
   // Move clip
   const moveClip = useCallback((clipId: string, newStart: number, newTrackId?: string): void => {
     setClips(prev => prev.map(c => {
@@ -666,6 +677,8 @@ export function useProject() {
   }, []);
 
   // Add multiple caption clips at once (batched for performance)
+  // Returns { clips, captionData } so callers can save immediately with explicit data
+  // without waiting for the React state update to propagate to refs.
   const addCaptionClipsBatch = useCallback((
     captions: Array<{
       words: CaptionWord[];
@@ -673,7 +686,7 @@ export function useProject() {
       duration: number;
       style?: Partial<CaptionStyle>;
     }>
-  ): TimelineClip[] => {
+  ): { clips: TimelineClip[]; captionData: Record<string, CaptionData> } => {
     const newClips: TimelineClip[] = [];
     const newCaptionData: Record<string, CaptionData> = {};
 
@@ -700,7 +713,7 @@ export function useProject() {
     setClips(prev => [...prev, ...newClips]);
     setCaptionData(prev => ({ ...prev, ...newCaptionData }));
 
-    return newClips;
+    return { clips: newClips, captionData: newCaptionData };
   }, []);
 
   // Clear all caption clips from T1 (and their captionData) — used before re-transcribing
@@ -732,13 +745,27 @@ export function useProject() {
     });
   }, []);
 
+  // Update just the words array for a caption clip (used by filler word removal)
+  const updateCaptionWords = useCallback((clipId: string, words: CaptionWord[]): void => {
+    setCaptionData(prev => {
+      const existing = prev[clipId];
+      if (!existing) return prev;
+      return { ...prev, [clipId]: { ...existing, words } };
+    });
+  }, []);
+
   // Get caption data for a clip
   const getCaptionData = useCallback((clipId: string): CaptionData | null => {
     return captionData[clipId] || null;
   }, [captionData]);
 
-  // Internal save helper (no debounce) — can accept an override clips array for immediate saves
-  const saveProjectNow = useCallback(async (overrideClips?: TimelineClip[]): Promise<void> => {
+  // Internal save helper (no debounce) — can accept override arrays for immediate saves
+  // Use overrideClips/overrideCaptionData when calling right after setClips/setCaptionData,
+  // since those state updates haven't propagated to the refs yet.
+  const saveProjectNow = useCallback(async (
+    overrideClips?: TimelineClip[],
+    overrideCaptionData?: Record<string, CaptionData>,
+  ): Promise<void> => {
     if (!session) return;
     try {
       await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
@@ -748,7 +775,7 @@ export function useProject() {
           tracks: tracksRef.current,
           clips: overrideClips ?? clipsRef.current,
           settings: settingsRef.current,
-          captionData: captionDataRef.current,
+          captionData: overrideCaptionData ?? captionDataRef.current,
         }),
       });
       console.log('[Project] Saved');
@@ -990,6 +1017,7 @@ export function useProject() {
     addClip,
     updateClip,
     deleteClip,
+    undoWorkflowClips,
     moveClip,
     resizeClip,
     splitClip,
@@ -1000,6 +1028,7 @@ export function useProject() {
     addCaptionClipsBatch,
     clearCaptionClips,
     updateCaptionStyle,
+    updateCaptionWords,
     getCaptionData,
 
     // Project

@@ -3,7 +3,7 @@ import { spawn, execSync } from 'child_process';
 
 // On Windows, npx must be invoked as npx.cmd (spawn doesn't use shell by default)
 const NPX_CMD = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync } from 'fs';
+import { createWriteStream, createReadStream, unlinkSync, mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, statSync, rmSync, renameSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
@@ -1365,6 +1365,20 @@ async function handleSessionChapters(req, res, sessionId) {
   const jobId = sessionId;
   const audioPath = join(session.dir, `audio-${Date.now()}.mp3`);
 
+  // Parse optional pre-built transcript from body (skips audio extraction)
+  let preBuiltTranscript = null;
+  try {
+    const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+    if (contentLength > 0) {
+      const bodyData = await new Promise((resolve) => {
+        let raw = '';
+        req.on('data', chunk => { raw += chunk; });
+        req.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve({}); } });
+      });
+      preBuiltTranscript = bodyData.transcript || null;
+    }
+  } catch { /* ignore */ }
+
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -1375,6 +1389,52 @@ async function handleSessionChapters(req, res, sessionId) {
 
     console.log(`\n[${jobId}] === CHAPTER GENERATION (Session) ===`);
 
+    // --- Fast path: use pre-built transcript from caption data ---
+    if (preBuiltTranscript) {
+      console.log(`[${jobId}] Using pre-built transcript (${preBuiltTranscript.length} chars) — skipping audio extraction`);
+
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{
+          role: 'user',
+          parts: [{ text: `Analyze this video transcript with word-level timestamps and identify logical chapter breaks based on topic changes or natural transitions.\n\nTranscript (format: [time] word):\n${preBuiltTranscript}\n\nFor each chapter:\n1. START timestamp (seconds, must match a timestamp from the transcript)\n2. Concise, descriptive title (2-6 words)\n\nGuidelines:\n- First chapter starts at 0\n- Aim for 3-8 chapters\n- At least 30 seconds apart\n- Engaging titles for YouTube\n\nReturn JSON: {"chapters": [{"start": 0, "title": "Introduction"}], "summary": "Brief summary"}` }]
+        }],
+        config: { responseMimeType: 'application/json' }
+      });
+
+      let responseText = '';
+      if (typeof response.text === 'function') responseText = await response.text();
+      else if (response.text) responseText = response.text;
+      else if (response.candidates?.[0]?.content?.parts?.[0]?.text) responseText = response.candidates[0].content.parts[0].text;
+
+      let result;
+      try { result = JSON.parse(responseText || '{}'); }
+      catch { const m = (responseText || '').match(/\{[\s\S]*\}/); result = m ? JSON.parse(m[0]) : { chapters: [], summary: '' }; }
+
+      if (!result.chapters || result.chapters.length === 0) {
+        result.chapters = [{ start: 0, title: 'Introduction' }];
+      }
+
+      const youtubeChapters = (result.chapters || [])
+        .sort((a, b) => a.start - b.start)
+        .map(ch => `${formatTimestamp(ch.start)} ${ch.title}`)
+        .join('\n');
+
+      console.log(`[${jobId}] Generated ${result.chapters.length} chapters from transcript`);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        success: true,
+        chapters: result.chapters || [],
+        youtubeFormat: youtubeChapters,
+        summary: result.summary || '',
+        videoDuration: 0,
+        source: 'captions',
+      }));
+      return;
+    }
+
+    // --- Standard path: extract audio + send to Gemini ---
     // Find video path - check both legacy currentVideo and new assets system
     let videoPath = session.currentVideo;
     if (!videoPath || !existsSync(videoPath)) {
@@ -3595,6 +3655,211 @@ Background: clean, uncluttered.`
 }
 
 // Handle B-roll generation endpoint
+async function handleSceneDetect(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    // Find video asset
+    let videoAsset = null;
+    for (const asset of session.assets.values()) {
+      if (asset.type === 'video' && !asset.aiGenerated && existsSync(asset.path)) { videoAsset = asset; break; }
+    }
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && existsSync(asset.path)) { videoAsset = asset; break; }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found in session' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === SCENE DETECT ===`);
+    console.log(`[${jobId}] Scanning: ${videoAsset.filename}`);
+
+    // Run FFmpeg with select+showinfo to detect scene changes
+    // select='gt(scene,0.3)' passes frames where scene change score > 0.3
+    const stderr = await runFFmpeg([
+      '-hide_banner',
+      '-i', videoAsset.path,
+      '-an',
+      '-vf', "select='gt(scene,0.3)',showinfo",
+      '-f', 'null', '-'
+    ], jobId);
+
+    // Parse showinfo output: "[Parsed_showinfo_1 @ ...] n: 2 pts: 75 pts_time:1.5000 ..."
+    const scenes = [];
+    const regex = /\[Parsed_showinfo[^\]]*\][^\n]*pts_time:([\d.]+)/g;
+    let match;
+    while ((match = regex.exec(stderr)) !== null) {
+      const t = parseFloat(match[1]);
+      if (t > 0.5) scenes.push({ timestamp: Math.round(t * 100) / 100 });
+    }
+
+    // Deduplicate: remove scenes within 1.5s of each other
+    const deduped = scenes.filter((s, i) =>
+      i === 0 || s.timestamp - scenes[i - 1].timestamp > 1.5
+    );
+
+    console.log(`[${jobId}] Detected ${deduped.length} scene changes`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, scenes: deduped, total: deduped.length }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Scene detect error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+async function handleMuteSegments(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { segments, assetId } = body; // segments: [{start, end}, ...]
+
+    if (!segments || segments.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'segments array is required' }));
+      return;
+    }
+
+    // Find the target video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && !asset.aiGenerated && existsSync(asset.path)) { videoAsset = asset; break; }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === MUTE SEGMENTS ===`);
+    console.log(`[${jobId}] Muting ${segments.length} segment(s) in: ${videoAsset.filename}`);
+
+    // Build FFmpeg volume=0 expression for all segments
+    // e.g. "volume=enable='between(t,0.5,0.8)+between(t,1.2,1.5)':volume=0"
+    const muteExpr = segments.map(s => `between(t,${s.start},${s.end})`).join('+');
+    const outputPath = join(session.assetsDir, `${videoAsset.id}_muted.mp4`);
+
+    await runFFmpeg([
+      '-y', '-i', videoAsset.path,
+      '-af', `volume=enable='${muteExpr}':volume=0`,
+      '-c:v', 'copy',
+      '-c:a', 'aac',
+      outputPath
+    ], jobId);
+
+    // Replace original file in-place
+    renameSync(outputPath, videoAsset.path);
+
+    console.log(`[${jobId}] Muted ${segments.length} segment(s) — file replaced in-place`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, mutedCount: segments.length, assetId: videoAsset.id }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Mute segments error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+async function handleResequence(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { instruction, transcript } = body;
+
+    if (!instruction) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'instruction is required' }));
+      return;
+    }
+
+    if (!transcript) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'transcript is required — add captions first' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === RESEQUENCE ===`);
+    console.log(`[${jobId}] Instruction: ${instruction}`);
+
+    const { GoogleGenAI } = await import('@google/genai');
+    const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+    const prompt = `You are a video editor assistant. Given a transcript with timestamps and a resequencing instruction, return a JSON array of section swaps.
+
+Transcript (format: "[Xs] word"):
+${transcript.substring(0, 6000)}
+
+Instruction: "${instruction}"
+
+Identify the sections the user wants to move. Return JSON like:
+{
+  "swaps": [
+    { "from": { "startTime": 12.5, "endTime": 28.0, "label": "pricing section" },
+      "to":   { "startTime": 45.0, "endTime": 60.0, "label": "demo section" } }
+  ],
+  "explanation": "Moving pricing (12.5s-28s) before demo (45s-60s)"
+}
+
+Rules:
+- startTime/endTime are seconds (floats)
+- Each swap moves the "from" section to where "to" currently is
+- If a section can't be identified from the transcript, set it to null
+- Return ONLY valid JSON, no markdown`;
+
+    const result = await genAI.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      config: { responseMimeType: 'application/json' },
+    });
+
+    const responseText = result.candidates[0].content.parts[0].text;
+    const data = JSON.parse(responseText);
+
+    console.log(`[${jobId}] Resequence plan:`, JSON.stringify(data));
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, ...data }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Resequence error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 async function handleGenerateBroll(req, res, sessionId) {
   const session = getSession(sessionId);
   if (!session) {
@@ -3638,13 +3903,37 @@ async function handleGenerateBroll(req, res, sessionId) {
 
     console.log(`[${jobId}] Using video: ${videoAsset.filename}`);
 
-    // Step 1: Transcribe the video
-    console.log(`[${jobId}] Step 1: Transcribing video...`);
-    const audioPath = join(TEMP_DIR, `${jobId}-broll-audio.mp3`);
+    // Parse optional pre-built transcript+words from request body (skips Whisper)
+    let preBuiltTranscription = null;
+    try {
+      const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+      if (contentLength > 0) {
+        const bodyData = await new Promise((resolve) => {
+          let raw = '';
+          req.on('data', chunk => { raw += chunk; });
+          req.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve({}); } });
+        });
+        if (bodyData.words && bodyData.words.length > 0) {
+          preBuiltTranscription = { text: bodyData.text || '', words: bodyData.words };
+        }
+      }
+    } catch { /* ignore */ }
+
     const totalDuration = await getVideoDuration(videoAsset.path);
 
-    // Check for transcription method
-    const hasLocalWhisper = await checkLocalWhisper();
+    let transcription;
+
+    if (preBuiltTranscription) {
+      // Fast path: use pre-built caption words — skip Whisper entirely
+      console.log(`[${jobId}] Step 1: Using pre-built caption data (${preBuiltTranscription.words.length} words) — skipping transcription`);
+      transcription = preBuiltTranscription;
+    } else {
+      // Standard path: transcribe the video
+      console.log(`[${jobId}] Step 1: Transcribing video...`);
+      const audioPath = join(TEMP_DIR, `${jobId}-broll-audio.mp3`);
+
+      // Check for transcription method
+      const hasLocalWhisper = await checkLocalWhisper();
     const openaiKey = process.env.OPENAI_API_KEY;
 
     // Extract audio
@@ -3736,7 +4025,8 @@ async function handleGenerateBroll(req, res, sessionId) {
       }
     }
 
-    try { unlinkSync(audioPath); } catch {}
+      try { unlinkSync(audioPath); } catch {}
+    } // end else (standard transcription path)
 
     console.log(`[${jobId}]    Transcript: "${transcription.text.substring(0, 100)}..."`);
     console.log(`[${jobId}]    Words: ${transcription.words?.length || 0}`);
@@ -7900,6 +8190,18 @@ const server = http.createServer(async (req, res) => {
     // Extract audio from video (creates audio asset + muted video)
     else if (req.method === 'POST' && action === 'extract-audio') {
       await handleExtractAudio(req, res, sessionId);
+    }
+    // Scene detection - detect visual scene changes
+    else if (req.method === 'POST' && action === 'scene-detect') {
+      await handleSceneDetect(req, res, sessionId);
+    }
+    // Mute specific time segments (for filler word audio removal)
+    else if (req.method === 'POST' && action === 'mute-segments') {
+      await handleMuteSegments(req, res, sessionId);
+    }
+    // Resequence sections based on captions (move X before Y)
+    else if (req.method === 'POST' && action === 'resequence') {
+      await handleResequence(req, res, sessionId);
     }
     // Generate video from image (DiCaprio agent)
     else if (req.method === 'POST' && action === 'generate-video') {
