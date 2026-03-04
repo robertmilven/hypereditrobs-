@@ -81,7 +81,15 @@ export default function Home() {
     updateTabAsset,
     // Settings
     setSettings,
+    setClips,
   } = useProject();
+
+  // Global undo stack (snapshot of clips array before destructive operations)
+  const undoStackRef = useRef<import('@/react-app/hooks/useProject').TimelineClip[][]>([]);
+  const handleGlobalUndo = useCallback(() => {
+    const prev = undoStackRef.current.pop();
+    if (prev) setClips(prev);
+  }, [setClips]);
 
   // Compute the active clips based on which tab is selected
   const activeClips = useMemo(() => {
@@ -981,6 +989,158 @@ export default function Home() {
     await loadProject();
     return { applied: true };
   }, [session, clips, loadProject]);
+
+  // Feature 1: Auto-Reframe — crop+scale to center subject
+  const handleAutoReframe = useCallback(async (assetId?: string): Promise<{ applied: boolean; width: number; height: number }> => {
+    if (!session) throw new Error('No session available');
+    const videoAsset = assetId ? assets.find(a => a.id === assetId) : assets.find(a => a.type === 'video' && !a.aiGenerated);
+    if (!videoAsset) throw new Error('No video asset found');
+    const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'auto-reframe', assetId: videoAsset.id }),
+    });
+    if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Auto-reframe failed'); }
+    const data = await resp.json();
+    await refreshAssets();
+    return data;
+  }, [session, assets, refreshAssets]);
+
+  // Feature 2: Auto-Duck — duck background music under speech
+  const handleAutoDuck = useCallback(async (musicAssetId: string): Promise<{ applied: boolean }> => {
+    if (!session) throw new Error('No session available');
+    const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'auto-duck', musicAssetId }),
+    });
+    if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Auto-duck failed'); }
+    const data = await resp.json();
+    await refreshAssets();
+    return data;
+  }, [session, refreshAssets]);
+
+  // Feature 3: Export SRT — client-side from captionData
+  const handleExportSRT = useCallback((): string => {
+    const t1Clips = clips.filter(c => c.trackId === 'T1').sort((a, b) => a.start - b.start);
+    const lines: string[] = [];
+    let idx = 1;
+    for (const clip of t1Clips) {
+      const cd = captionData[clip.id];
+      if (!cd?.words?.length) continue;
+      // Group words into chunks (same chunking logic as transcription)
+      const words = cd.words;
+      let chunkStart = 0;
+      while (chunkStart < words.length) {
+        let chunkEnd = chunkStart;
+        while (chunkEnd + 1 < words.length && chunkEnd - chunkStart < 4 &&
+               words[chunkEnd + 1].start - words[chunkEnd].end < 0.7) {
+          chunkEnd++;
+        }
+        const absStart = clip.start + words[chunkStart].start;
+        const absEnd = clip.start + words[chunkEnd].end;
+        const text = words.slice(chunkStart, chunkEnd + 1).map(w => w.text).join(' ');
+        const fmt = (s: number) => {
+          const h = Math.floor(s / 3600);
+          const m = Math.floor((s % 3600) / 60);
+          const sec = Math.floor(s % 60);
+          const ms = Math.round((s % 1) * 1000);
+          return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+        };
+        lines.push(`${idx}\n${fmt(absStart)} --> ${fmt(absEnd)}\n${text}\n`);
+        idx++;
+        chunkStart = chunkEnd + 1;
+      }
+    }
+    return lines.join('\n');
+  }, [clips, captionData]);
+
+  // Feature 5: Silence Preview — return silence info without cutting
+  const handleSilencePreview = useCallback(async (): Promise<{
+    silences: Array<{ start: number; end: number; duration: number }>;
+    totalSilence: number;
+    videoDuration: number;
+    wouldReduceTo: number;
+  }> => {
+    if (!session) throw new Error('No session available');
+    const videoAsset = assets.find(a => a.type === 'video' && !a.aiGenerated);
+    if (!videoAsset) throw new Error('No video asset found');
+    const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'silence-preview', assetId: videoAsset.id }),
+    });
+    if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Silence preview failed'); }
+    return resp.json();
+  }, [session, assets]);
+
+  // Feature 6: Highlight Reel — compile best moments into new asset
+  const handleHighlightReel = useCallback(async (durationSecs?: number): Promise<{ assetId: string; duration: number }> => {
+    if (!session) throw new Error('No session available');
+    const videoAsset = assets.find(a => a.type === 'video' && !a.aiGenerated);
+    if (!videoAsset) throw new Error('No video asset found');
+    const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'highlight-reel', assetId: videoAsset.id, targetDuration: durationSecs ?? 60 }),
+    });
+    if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Highlight reel failed'); }
+    const data = await resp.json();
+    await refreshAssets();
+    return data;
+  }, [session, assets, refreshAssets]);
+
+  // Feature 7: Translate Captions
+  const handleTranslateCaptions = useCallback(async (targetLanguage: string): Promise<{ translated: number }> => {
+    if (!session) throw new Error('No session available');
+    const t1Clips = clips.filter(c => c.trackId === 'T1');
+    if (t1Clips.length === 0) throw new Error('No captions found. Add captions first.');
+    const results: typeof captionData = {};
+    for (const clip of t1Clips) {
+      const cd = captionData[clip.id];
+      if (!cd?.words?.length) continue;
+      const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'translate-captions', words: cd.words, targetLanguage }),
+      });
+      if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Translation failed'); }
+      const data = await resp.json();
+      results[clip.id] = { ...cd, words: data.words };
+    }
+    for (const [clipId, cd] of Object.entries(results)) {
+      updateCaptionWords(clipId, cd.words);
+    }
+    return { translated: Object.keys(results).length };
+  }, [session, clips, captionData, updateCaptionWords]);
+
+  // Feature 8: Generate Thumbnail
+  const handleGenerateThumbnail = useCallback(async (timestamp?: number): Promise<{ assetId: string }> => {
+    if (!session) throw new Error('No session available');
+    const videoAsset = assets.find(a => a.type === 'video' && !a.aiGenerated);
+    if (!videoAsset) throw new Error('No video asset found');
+    const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'generate-thumbnail', assetId: videoAsset.id, timestamp }),
+    });
+    if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Thumbnail generation failed'); }
+    const data = await resp.json();
+    await refreshAssets();
+    return data;
+  }, [session, assets, refreshAssets]);
+
+  // Feature 9: Waveform Data
+  const handleWaveformData = useCallback(async (assetId: string): Promise<{ samples: number[]; sampleRate: number }> => {
+    if (!session) throw new Error('No session available');
+    const resp = await fetch(`http://localhost:3333/session/${session.sessionId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'waveform-data', assetId }),
+    });
+    if (!resp.ok) { const e = await resp.json(); throw new Error(e.error || 'Waveform data failed'); }
+    return resp.json();
+  }, [session]);
 
   // Handle auto-extract keywords and add GIFs
   const handleExtractKeywordsAndAddGifs = useCallback(async () => {
@@ -2233,6 +2393,7 @@ export default function Home() {
               onSave={saveProject}
               onDeleteAllCaptionClips={handleClearAllCaptionClips}
               getCaptionData={getCaptionData}
+              onUndo={handleGlobalUndo}
             />
           </ResizableVerticalPanel>
         </div>
@@ -2325,6 +2486,14 @@ export default function Home() {
                   onMuteFillerWords={handleMuteFillerWords}
                   onResequence={handleResequence}
                   onApplyResequence={handleApplyResequence}
+                  onAutoReframe={handleAutoReframe}
+                  onAutoDuck={handleAutoDuck}
+                  onExportSRT={handleExportSRT}
+                  onSilencePreview={handleSilencePreview}
+                  onHighlightReel={handleHighlightReel}
+                  onTranslateCaptions={handleTranslateCaptions}
+                  onGenerateThumbnail={handleGenerateThumbnail}
+                  onWaveformData={handleWaveformData}
                 />
               </div>
               <div className={`absolute inset-0 ${activeAgent === 'picasso' ? '' : 'hidden'}`}>

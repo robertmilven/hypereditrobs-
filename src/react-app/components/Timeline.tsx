@@ -28,6 +28,7 @@ interface TimelineProps {
   onSave: () => void;
   onDeleteAllCaptionClips?: () => void;
   getCaptionData?: (clipId: string) => CaptionData | null;
+  onUndo?: () => void;
 }
 
 const TRACK_HEIGHTS: Record<string, number> = {
@@ -67,6 +68,7 @@ export default function Timeline({
   onSave,
   onDeleteAllCaptionClips,
   getCaptionData,
+  onUndo,
 }: TimelineProps) {
   const [zoom, setZoom] = useState(1);
   const [isDraggingPlayhead, setIsDraggingPlayhead] = useState(false);
@@ -94,6 +96,14 @@ export default function Timeline({
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Delete selected clip with Delete or Backspace key
+      // Ctrl+Z undo
+      if ((e.key === 'z' || e.key === 'Z') && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+        if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+        e.preventDefault();
+        onUndo?.();
+        return;
+      }
+
       if ((e.key === 'Delete' || e.key === 'Backspace') && selectedClipId) {
         // Don't trigger if user is typing in an input
         if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {

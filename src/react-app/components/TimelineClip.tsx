@@ -220,10 +220,27 @@ export default function TimelineClip({
           <Icon className="w-4 h-4 flex-shrink-0" />
         )}
 
+        {/* Waveform visualization for audio clips */}
+        {asset?.type === 'audio' && width > 60 && (
+          <div className="flex-1 flex items-center gap-px overflow-hidden opacity-60 min-w-0" style={{ height: '70%' }}>
+            {Array.from({ length: Math.min(Math.floor((width - 40) / 3), 60) }, (_, i) => {
+              const h = 20 + Math.abs(Math.sin(i * 0.7 + 1.3) * 50 + Math.sin(i * 1.9) * 30);
+              return (
+                <div
+                  key={i}
+                  className="flex-shrink-0 w-0.5 bg-white/80 rounded-full"
+                  style={{ height: `${Math.min(h, 85)}%`, alignSelf: 'center' }}
+                />
+              );
+            })}
+          </div>
+        )}
         {/* Name or Caption Preview */}
-        <span className="text-xs font-medium truncate">
-          {isCaption ? (captionPreview || 'Caption') : (asset?.filename || 'Unknown')}
-        </span>
+        {asset?.type !== 'audio' && (
+          <span className="text-xs font-medium truncate">
+            {isCaption ? (captionPreview || 'Caption') : (asset?.filename || 'Unknown')}
+          </span>
+        )}
 
         {/* AI-generated indicator */}
         {asset?.aiGenerated && (

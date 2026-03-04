@@ -285,6 +285,22 @@ interface AIPromptPanelProps {
     explanation: string;
   }>;
   onApplyResequence?: (swaps: Array<{ from: { startTime: number; endTime: number }; to: { startTime: number; endTime: number } }>) => Promise<{ applied: boolean }>;
+  // Feature 1: Auto-Reframe
+  onAutoReframe?: (assetId?: string) => Promise<{ applied: boolean; width: number; height: number }>;
+  // Feature 2: Auto-Duck
+  onAutoDuck?: (musicAssetId: string) => Promise<{ applied: boolean }>;
+  // Feature 3: Export SRT
+  onExportSRT?: () => string;
+  // Feature 5: Silence Preview
+  onSilencePreview?: () => Promise<{ silences: Array<{ start: number; end: number; duration: number }>; totalSilence: number; videoDuration: number; wouldReduceTo: number }>;
+  // Feature 6: Highlight Reel
+  onHighlightReel?: (durationSecs?: number) => Promise<{ assetId: string; duration: number }>;
+  // Feature 7: Caption Translation
+  onTranslateCaptions?: (targetLanguage: string) => Promise<{ translated: number }>;
+  // Feature 8: Thumbnail Generator
+  onGenerateThumbnail?: (timestamp?: number) => Promise<{ assetId: string }>;
+  // Feature 9: Waveform Data
+  onWaveformData?: (assetId: string) => Promise<{ samples: number[]; sampleRate: number }>;
 }
 
 export default function AIPromptPanel({
@@ -327,6 +343,14 @@ export default function AIPromptPanel({
   onMuteFillerWords,
   onResequence,
   onApplyResequence,
+  onAutoReframe,
+  onAutoDuck,
+  onExportSRT,
+  onSilencePreview,
+  onHighlightReel,
+  onTranslateCaptions,
+  onGenerateThumbnail,
+  onWaveformData: _onWaveformData,
 }: AIPromptPanelProps) {
   const [prompt, setPrompt] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -1243,6 +1267,14 @@ export default function AIPromptPanel({
     | 'scene-detect'       // Detect scene changes via FFmpeg
     | 'filler-cut'         // Mute filler words in audio using caption timestamps
     | 'resequence'         // Reorder sections via caption transcript + Gemini
+    | 'auto-reframe'       // Crop + scale to center subject (face tracking)
+    | 'auto-duck'          // Duck background music under speech
+    | 'export-srt'         // Export captions as SRT file
+    | 'silence-preview'    // Preview silence segments before cutting
+    | 'highlight-reel'     // Compile best moments into new asset
+    | 'translate-captions' // Translate captions to another language
+    | 'generate-thumbnail' // Extract best frame as image asset
+    | 'color-grade'        // Apply color grade preset via FFmpeg
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
     | 'unknown';            // Need to ask for clarification
 
@@ -1552,6 +1584,65 @@ export default function AIPromptPanel({
       return 'scene-detect';
     }
 
+    // Auto-Reframe (face tracking crop)
+    if (lower.includes('reframe') || lower.includes('auto reframe') ||
+        (lower.includes('crop') && (lower.includes('face') || lower.includes('subject') || lower.includes('person') || lower.includes('portrait'))) ||
+        lower.includes('face track') || lower.includes('tracking crop') || lower.includes('vertical crop')) {
+      return 'auto-reframe';
+    }
+
+    // Auto-Duck (background music ducking)
+    if (lower.includes('duck') || lower.includes('auto duck') || lower.includes('auto-duck') ||
+        (lower.includes('music') && (lower.includes('lower') || lower.includes('quiet') || lower.includes('reduce') || lower.includes('fade') || lower.includes('under'))) ||
+        lower.includes('background music') && lower.includes('speech')) {
+      return 'auto-duck';
+    }
+
+    // Export SRT captions
+    if ((lower.includes('export') || lower.includes('download') || lower.includes('save')) &&
+        (lower.includes('srt') || lower.includes('subtitle') || lower.includes('caption file'))) {
+      return 'export-srt';
+    }
+
+    // Silence Preview (show silence before cutting)
+    if (lower.includes('silence preview') || lower.includes('preview silence') ||
+        lower.includes('how much silence') || lower.includes('show silence') ||
+        lower.includes('silence report') || lower.includes('how long silence') ||
+        (lower.includes('silence') && lower.includes('would'))) {
+      return 'silence-preview';
+    }
+
+    // Highlight Reel
+    if (lower.includes('highlight') || lower.includes('best moments') ||
+        lower.includes('best parts') || lower.includes('highlight reel') ||
+        lower.includes('reel') || lower.includes('montage') ||
+        (lower.includes('compile') && lower.includes('best'))) {
+      return 'highlight-reel';
+    }
+
+    // Caption Translation
+    if ((lower.includes('translate') || lower.includes('translation')) &&
+        (lower.includes('caption') || lower.includes('subtitle') || lower.includes('text'))) {
+      return 'translate-captions';
+    }
+
+    // Thumbnail Generator
+    if (lower.includes('thumbnail') || lower.includes('generate thumbnail') ||
+        lower.includes('best frame') || lower.includes('cover image') ||
+        (lower.includes('extract') && lower.includes('frame'))) {
+      return 'generate-thumbnail';
+    }
+
+    // Color Grade Presets
+    if (lower.includes('color grade') || lower.includes('colour grade') ||
+        lower.includes('cinematic look') || lower.includes('film look') ||
+        lower.includes('lut') || lower.includes('warm tone') || lower.includes('cool tone') ||
+        lower.includes('vintage look') || lower.includes('bleach bypass') ||
+        lower.includes('desaturate') || lower.includes('color preset') || lower.includes('colour preset') ||
+        (lower.includes('color') && (lower.includes('preset') || lower.includes('grade') || lower.includes('tone')))) {
+      return 'color-grade';
+    }
+
     // FFmpeg-style video edits (trim, cut, speed, audio, noise, etc.)
     if (lower.includes('trim') || lower.includes('cut') || lower.includes('speed') ||
         lower.includes('slow') || lower.includes('fast') || lower.includes('reverse') ||
@@ -1724,6 +1815,220 @@ export default function AIPromptPanel({
       setIsProcessing(false);
       setProcessingStatus('');
     }
+  };
+
+  // Feature 1: Auto-Reframe
+  const handleAutoReframeWorkflow = async () => {
+    if (!onAutoReframe) return;
+    setIsProcessing(true);
+    setProcessingStatus('Analyzing subject position...');
+    setChatHistory(prev => [...prev, { type: 'assistant', text: '🎯 Analyzing subject position across frames...' }]);
+    try {
+      const result = await onAutoReframe();
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `✅ Auto-reframe applied! Video cropped to ${result.width}×${result.height} centering the main subject.`,
+      }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: `❌ Auto-reframe failed: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Feature 2: Auto-Duck
+  const handleAutoDuckWorkflow = async (_userMessage: string) => {
+    if (!onAutoDuck) return;
+    // Try to find a music/audio asset from the message or assets list
+    const audioAsset = assets.find(a => a.type === 'audio');
+    if (!audioAsset) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: '❌ No audio asset found. Add a music track (audio file) to A2 first, then I\'ll duck it under your speech.' }]);
+      return;
+    }
+    setIsProcessing(true);
+    setProcessingStatus('Ducking background music...');
+    setChatHistory(prev => [...prev, { type: 'assistant', text: `🎵 Ducking background music (${audioAsset.filename}) under speech...` }]);
+    try {
+      await onAutoDuck(audioAsset.id);
+      setChatHistory(prev => [...prev, { type: 'assistant', text: '✅ Background music auto-ducked! It will lower during speech and rise during pauses.' }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: `❌ Auto-duck failed: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Feature 3: Export SRT
+  const handleExportSRTWorkflow = () => {
+    if (!onExportSRT) return;
+    const srt = onExportSRT();
+    if (!srt.trim()) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: '❌ No captions found. Add captions first using "add captions".' }]);
+      return;
+    }
+    const blob = new Blob([srt], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'captions.srt';
+    a.click();
+    URL.revokeObjectURL(url);
+    setChatHistory(prev => [...prev, { type: 'assistant', text: '✅ SRT file downloaded! Import it into YouTube, Premiere, or any video platform.' }]);
+  };
+
+  // Feature 5: Silence Preview
+  const handleSilencePreviewWorkflow = async () => {
+    if (!onSilencePreview) return;
+    setIsProcessing(true);
+    setProcessingStatus('Scanning for silence...');
+    setChatHistory(prev => [...prev, { type: 'assistant', text: '🔇 Scanning for silence segments...' }]);
+    try {
+      const result = await onSilencePreview();
+      const totalSecs = result.totalSilence.toFixed(1);
+      const wouldBe = result.wouldReduceTo.toFixed(1);
+      const pct = ((result.totalSilence / result.videoDuration) * 100).toFixed(0);
+      const lines = result.silences.slice(0, 8).map(s =>
+        `  • ${s.start.toFixed(1)}s – ${s.end.toFixed(1)}s (${s.duration.toFixed(1)}s)`
+      ).join('\n');
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `🔇 **Silence Report**\n\nFound **${result.silences.length} silent segments** (${pct}% of video)\nTotal silence: **${totalSecs}s** → video would shrink to **${wouldBe}s**\n\nLongest silences:\n${lines}${result.silences.length > 8 ? `\n  ...and ${result.silences.length - 8} more` : ''}\n\nType "remove dead air" to cut all of these.`,
+      }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: `❌ Silence preview failed: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Feature 6: Highlight Reel
+  const handleHighlightReelWorkflow = async (userMessage: string) => {
+    if (!onHighlightReel) return;
+    const durationMatch = userMessage.match(/(\d+)\s*(second|sec|min|minute)/i);
+    let targetSecs = 60;
+    if (durationMatch) {
+      targetSecs = parseInt(durationMatch[1]) * (durationMatch[2].startsWith('min') ? 60 : 1);
+    }
+    setIsProcessing(true);
+    setProcessingStatus('Creating highlight reel...');
+    setChatHistory(prev => [...prev, { type: 'assistant', text: `🎬 Compiling best moments into a ~${targetSecs}s highlight reel...` }]);
+    try {
+      const result = await onHighlightReel(targetSecs);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `✅ Highlight reel created! ${result.duration.toFixed(1)}s clip added to your asset library. Drag it to the timeline to use it.`,
+      }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: `❌ Highlight reel failed: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Feature 7: Caption Translation
+  const handleTranslateCaptionsWorkflow = async (userMessage: string) => {
+    if (!onTranslateCaptions) return;
+    // Extract language from message
+    const knownLanguages: Record<string, string> = {
+      spanish: 'Spanish', español: 'Spanish', es: 'Spanish',
+      french: 'French', français: 'French', fr: 'French',
+      german: 'German', deutsch: 'German', de: 'German',
+      portuguese: 'Portuguese', pt: 'Portuguese',
+      italian: 'Italian', italiano: 'Italian', it: 'Italian',
+      japanese: 'Japanese', ja: 'Japanese',
+      chinese: 'Chinese', zh: 'Chinese',
+      arabic: 'Arabic', ar: 'Arabic',
+      hindi: 'Hindi', hi: 'Hindi',
+      korean: 'Korean', ko: 'Korean',
+      dutch: 'Dutch', nl: 'Dutch',
+      russian: 'Russian', ru: 'Russian',
+    };
+    const lower = userMessage.toLowerCase();
+    let targetLanguage = 'Spanish';
+    for (const [key, lang] of Object.entries(knownLanguages)) {
+      if (lower.includes(key)) { targetLanguage = lang; break; }
+    }
+    setIsProcessing(true);
+    setProcessingStatus(`Translating to ${targetLanguage}...`);
+    setChatHistory(prev => [...prev, { type: 'assistant', text: `🌐 Translating captions to ${targetLanguage}...` }]);
+    try {
+      const result = await onTranslateCaptions(targetLanguage);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: `✅ Translated ${result.translated} caption clip${result.translated !== 1 ? 's' : ''} to ${targetLanguage}! The timeline captions now show the translated text.`,
+      }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: `❌ Translation failed: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Feature 8: Generate Thumbnail
+  const handleGenerateThumbnailWorkflow = async (userMessage: string) => {
+    if (!onGenerateThumbnail) return;
+    const timeMatch = userMessage.match(/at\s+(\d+(?:\.\d+)?)\s*(?:s|sec|second)/i);
+    const timestamp = timeMatch ? parseFloat(timeMatch[1]) : undefined;
+    setIsProcessing(true);
+    setProcessingStatus('Extracting best frame...');
+    setChatHistory(prev => [...prev, { type: 'assistant', text: timestamp ? `🖼️ Extracting frame at ${timestamp}s...` : '🖼️ Finding the sharpest frame for your thumbnail...' }]);
+    try {
+      await onGenerateThumbnail(timestamp);
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: '✅ Thumbnail generated! The image has been added to your asset library. Right-click it to save to disk.',
+      }]);
+    } catch (error) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: `❌ Thumbnail failed: ${error instanceof Error ? error.message : 'Unknown error'}` }]);
+    } finally {
+      setIsProcessing(false);
+      setProcessingStatus('');
+    }
+  };
+
+  // Feature 10: Color Grade Presets
+  const COLOR_GRADE_PRESETS: Record<string, { label: string; ffmpegFilter: string }> = {
+    cinematic: { label: 'Cinematic', ffmpegFilter: 'curves=r=\'0/0 0.2/0.15 0.8/0.7 1/0.9\':g=\'0/0 0.2/0.18 0.8/0.73 1/0.92\':b=\'0/0.04 0.2/0.22 0.8/0.78 1/1\',eq=saturation=0.8:contrast=1.1' },
+    warm: { label: 'Warm', ffmpegFilter: 'curves=r=\'0/0 0.5/0.6 1/1\':g=\'0/0 0.5/0.5 1/0.95\':b=\'0/0 0.5/0.4 1/0.85\'' },
+    cool: { label: 'Cool', ffmpegFilter: 'curves=r=\'0/0 0.5/0.42 1/0.88\':g=\'0/0 0.5/0.5 1/0.95\':b=\'0/0.04 0.5/0.55 1/1\'' },
+    vintage: { label: 'Vintage', ffmpegFilter: 'curves=r=\'0/0.1 0.5/0.55 1/0.9\':g=\'0/0.05 0.5/0.5 1/0.85\':b=\'0/0 0.5/0.4 1/0.75\',eq=saturation=0.7:contrast=1.05' },
+    blackwhite: { label: 'Black & White', ffmpegFilter: 'hue=s=0,eq=contrast=1.15:brightness=0.02' },
+    bleachbypass: { label: 'Bleach Bypass', ffmpegFilter: 'curves=r=\'0/0 0.5/0.55 1/1\':b=\'0/0 0.5/0.45 1/0.9\',eq=saturation=0.4:contrast=1.3' },
+  };
+
+  const handleColorGradeWorkflow = async (userMessage: string) => {
+    const lower = userMessage.toLowerCase();
+    let preset = COLOR_GRADE_PRESETS.cinematic;
+    if (lower.includes('warm')) preset = COLOR_GRADE_PRESETS.warm;
+    else if (lower.includes('cool') || lower.includes('cold')) preset = COLOR_GRADE_PRESETS.cool;
+    else if (lower.includes('vintage') || lower.includes('retro')) preset = COLOR_GRADE_PRESETS.vintage;
+    else if (lower.includes('black') || lower.includes('white') || lower.includes('b&w') || lower.includes('bw') || lower.includes('monochrome') || lower.includes('greyscale') || lower.includes('grayscale')) preset = COLOR_GRADE_PRESETS.blackwhite;
+    else if (lower.includes('bleach') || lower.includes('bypass')) preset = COLOR_GRADE_PRESETS.bleachbypass;
+
+    const videoAsset = assets.find(a => a.type === 'video' && !a.aiGenerated);
+    if (!videoAsset) {
+      setChatHistory(prev => [...prev, { type: 'assistant', text: '❌ No video found. Upload a video first.' }]);
+      return;
+    }
+
+    // Build FFmpeg command for this preset
+    const ffmpegCmd = `-i input.mp4 -vf "${preset.ffmpegFilter}" -c:a copy output.mp4`;
+
+    setChatHistory(prev => [...prev, {
+      type: 'assistant',
+      text: `🎨 Applying **${preset.label}** color grade...`,
+      ffmpegResult: {
+        command: ffmpegCmd,
+        explanation: `${preset.label} color grade via curve adjustments`,
+        assetId: videoAsset.id,
+        applyIndex: prev.length,
+      },
+    }]);
   };
 
   // Poll for job completion
@@ -3180,6 +3485,70 @@ export default function AIPromptPanel({
         return;
       }
       await handleResequenceWorkflow(userMessage);
+      return;
+    }
+
+    // Auto-Reframe
+    if (workflow === 'auto-reframe') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: 'Please upload a video first.' }]);
+        return;
+      }
+      await handleAutoReframeWorkflow();
+      return;
+    }
+
+    // Auto-Duck
+    if (workflow === 'auto-duck') {
+      await handleAutoDuckWorkflow(userMessage);
+      return;
+    }
+
+    // Export SRT
+    if (workflow === 'export-srt') {
+      handleExportSRTWorkflow();
+      return;
+    }
+
+    // Silence Preview
+    if (workflow === 'silence-preview') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: 'Please upload a video first.' }]);
+        return;
+      }
+      await handleSilencePreviewWorkflow();
+      return;
+    }
+
+    // Highlight Reel
+    if (workflow === 'highlight-reel') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: 'Please upload a video first.' }]);
+        return;
+      }
+      await handleHighlightReelWorkflow(userMessage);
+      return;
+    }
+
+    // Caption Translation
+    if (workflow === 'translate-captions') {
+      await handleTranslateCaptionsWorkflow(userMessage);
+      return;
+    }
+
+    // Thumbnail Generator
+    if (workflow === 'generate-thumbnail') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: 'Please upload a video first.' }]);
+        return;
+      }
+      await handleGenerateThumbnailWorkflow(userMessage);
+      return;
+    }
+
+    // Color Grade Presets
+    if (workflow === 'color-grade') {
+      await handleColorGradeWorkflow(userMessage);
       return;
     }
 

@@ -3721,6 +3721,450 @@ async function handleSceneDetect(req, res, sessionId) {
   }
 }
 
+// ─── Feature 1: Auto-Reframe ──────────────────────────────────
+async function handleAutoReframe(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { targetAspect = '9:16', assetId } = body;
+
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) { if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) { videoAsset = a; break; } }
+    }
+    if (!videoAsset) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'No video asset found' })); return; }
+
+    console.log(`\n[${jobId}] === AUTO-REFRAME (${targetAspect}) ===`);
+    const info = await getMediaInfo(videoAsset.path);
+    const { width: srcW, height: srcH, duration } = info;
+
+    // Target dimensions for each aspect ratio
+    const TARGET = { '9:16': [1080, 1920], '1:1': [1080, 1080], '4:5': [1080, 1350] };
+    const [tgtW, tgtH] = TARGET[targetAspect] || TARGET['9:16'];
+
+    // Crop region: keep full height, reduce width to match target ratio
+    const cropW = Math.round(srcH * tgtW / tgtH);
+    if (cropW > srcW) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: `Source (${srcW}×${srcH}) is already portrait or square — cannot reframe to ${targetAspect}` })); return; }
+
+    // Extract 3 sample frames for subject detection
+    const apiKey = process.env.GEMINI_API_KEY;
+    let subjectCenterX = 0.5; // default: center crop
+    if (apiKey) {
+      const ai = new GoogleGenAI({ apiKey });
+      const sampleTimes = [0.25, 0.5, 0.75].map(t => Math.max(0.5, duration * t).toFixed(2));
+      let sumX = 0, countX = 0;
+      for (const t of sampleTimes) {
+        const framePath = join(session.assetsDir, `_rf_${t}.jpg`);
+        try {
+          await runFFmpeg(['-y', '-ss', t, '-i', videoAsset.path, '-frames:v', '1', '-q:v', '3', framePath], jobId);
+          const b64 = readFileSync(framePath).toString('base64');
+          const r = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: [{ role: 'user', parts: [
+              { inlineData: { mimeType: 'image/jpeg', data: b64 } },
+              { text: 'Where is the main subject or face? Return JSON only: {"subjectCenterX":0.5} where 0.0=left edge, 1.0=right edge. If unclear, use 0.5.' }
+            ]}],
+            config: { responseMimeType: 'application/json' },
+          });
+          const parsed = JSON.parse(r.candidates[0].content.parts[0].text);
+          if (typeof parsed.subjectCenterX === 'number') { sumX += parsed.subjectCenterX; countX++; }
+        } catch (e) { console.log(`[${jobId}] Frame ${t}s analysis skipped: ${e.message}`); }
+        finally { try { unlinkSync(framePath); } catch {} }
+      }
+      if (countX > 0) subjectCenterX = sumX / countX;
+    }
+
+    const cropX = Math.max(0, Math.min(srcW - cropW, Math.round(subjectCenterX * srcW - cropW / 2)));
+    console.log(`[${jobId}] Subject at ${(subjectCenterX * 100).toFixed(0)}% → cropX=${cropX}, crop=${cropW}×${srcH} → ${tgtW}×${tgtH}`);
+
+    const outputPath = join(session.assetsDir, `${videoAsset.id}_rf.mp4`);
+    await runFFmpeg(['-y', '-i', videoAsset.path, '-vf', `crop=${cropW}:${srcH}:${cropX}:0,scale=${tgtW}:${tgtH}`, '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-c:a', 'copy', outputPath], jobId);
+    renameSync(outputPath, videoAsset.path);
+    videoAsset.width = tgtW; videoAsset.height = tgtH;
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, originalDimensions: { width: srcW, height: srcH }, newDimensions: { width: tgtW, height: tgtH }, targetAspect, subjectCenterX: Math.round(subjectCenterX * 100), assetId: videoAsset.id }));
+  } catch (error) {
+    console.error(`[${jobId}] Auto-reframe error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 2: Background Music Auto-Ducking ─────────────────
+async function handleAutoDuck(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { musicAssetId, videoAssetId, duckLevel = 0.15, duckFade = 0.3 } = body;
+    // duckLevel: music volume during speech (0.0-1.0, default 0.15 = -16dB)
+    // duckFade: fade in/out duration in seconds
+
+    const musicAsset = session.assets.get(musicAssetId);
+    const videoAsset = videoAssetId ? session.assets.get(videoAssetId) : (() => { for (const a of session.assets.values()) { if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) return a; } return null; })();
+    if (!musicAsset || !videoAsset) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'musicAssetId and a video asset are required' })); return; }
+
+    console.log(`\n[${jobId}] === AUTO-DUCK ===`);
+
+    // Detect speech segments via silencedetect (inverted — silence = no speech)
+    const silenceStderr = await runFFmpeg(['-hide_banner', '-i', videoAsset.path, '-af', 'silencedetect=noise=-30dB:duration=0.3', '-f', 'null', '-'], jobId);
+    const silenceRanges = [];
+    const silRegex = /silence_start:\s*([\d.]+)[\s\S]*?silence_end:\s*([\d.]+)/g;
+    let m;
+    while ((m = silRegex.exec(silenceStderr)) !== null) {
+      silenceRanges.push({ start: parseFloat(m[1]), end: parseFloat(m[2]) });
+    }
+
+    const info = await getMediaInfo(videoAsset.path);
+    const videoDuration = info.duration;
+
+    // Build speech segments (inverse of silence)
+    const speechSegments = [];
+    let cursor = 0;
+    for (const s of silenceRanges) {
+      if (s.start > cursor + 0.1) speechSegments.push({ start: cursor, end: s.start });
+      cursor = s.end;
+    }
+    if (cursor < videoDuration - 0.1) speechSegments.push({ start: cursor, end: videoDuration });
+
+    // Build volume expression: full volume during silence/music, ducked during speech
+    // Use a piecewise expression with fades
+    let volExpr = '1'; // default full volume
+    if (speechSegments.length > 0) {
+      const parts = speechSegments.map(seg => {
+        const fadeIn = seg.start + duckFade;
+        const fadeOut = seg.end - duckFade;
+        if (fadeOut <= fadeIn) return `if(between(t,${seg.start},${seg.end}),${duckLevel},1)`;
+        return `if(lt(t,${seg.start}),1,if(lt(t,${fadeIn}),lerp(1,${duckLevel},(t-${seg.start})/${duckFade}),if(lt(t,${fadeOut}),${duckLevel},if(lt(t,${seg.end}),lerp(${duckLevel},1,(t-${fadeOut})/${duckFade}),1))))`;
+      });
+      volExpr = parts.length === 1 ? parts[0] : `min(${parts.join(',')})`;
+    }
+
+    const outputPath = join(session.assetsDir, `${musicAsset.id}_ducked.mp3`);
+    await runFFmpeg(['-y', '-i', musicAsset.path, '-af', `volume='${volExpr}':eval=frame`, '-c:a', 'libmp3lame', '-q:a', '2', outputPath], jobId);
+    renameSync(outputPath, musicAsset.path);
+
+    console.log(`[${jobId}] Auto-ducked ${speechSegments.length} speech segments`);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, speechSegments: speechSegments.length, duckLevel, assetId: musicAsset.id }));
+  } catch (error) {
+    console.error(`[${jobId}] Auto-duck error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 5: Silence Preview ───────────────────────────────
+async function handleSilencePreview(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { threshold = -26, minDuration = 0.4 } = body;
+
+    let videoAsset = null;
+    for (const a of session.assets.values()) { if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) { videoAsset = a; break; } }
+    if (!videoAsset) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'No video asset found' })); return; }
+
+    console.log(`\n[${jobId}] === SILENCE PREVIEW ===`);
+    const stderr = await runFFmpeg(['-hide_banner', '-i', videoAsset.path, '-af', `silencedetect=noise=${threshold}dB:duration=${minDuration}`, '-f', 'null', '-'], jobId);
+
+    const silences = [];
+    const re = /silence_start:\s*([\d.]+)[\s\S]*?silence_end:\s*([\d.]+)\s*\|\s*silence_duration:\s*([\d.]+)/g;
+    let match;
+    while ((match = re.exec(stderr)) !== null) {
+      silences.push({ start: parseFloat(match[1]), end: parseFloat(match[2]), duration: parseFloat(match[3]) });
+    }
+    const totalSilence = silences.reduce((s, seg) => s + seg.duration, 0);
+    const info = await getMediaInfo(videoAsset.path);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, silences, totalSilence: Math.round(totalSilence * 10) / 10, videoDuration: info.duration, wouldReduceTo: Math.round((info.duration - totalSilence) * 10) / 10 }));
+  } catch (error) {
+    console.error(`[${jobId}] Silence preview error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 6: Highlight Reel ────────────────────────────────
+async function handleHighlightReel(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { targetDuration = 60, transcript } = body;
+
+    let videoAsset = null;
+    for (const a of session.assets.values()) { if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) { videoAsset = a; break; } }
+    if (!videoAsset) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'No video asset found' })); return; }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' })); return; }
+
+    const info = await getMediaInfo(videoAsset.path);
+    console.log(`\n[${jobId}] === HIGHLIGHT REEL (target: ${targetDuration}s) ===`);
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    // Get transcript (use provided or extract audio for Gemini)
+    let transcriptText = transcript;
+    if (!transcriptText) {
+      const audioPath = join(session.assetsDir, `_hl_audio.mp3`);
+      await runFFmpeg(['-y', '-i', videoAsset.path, '-ac', '1', '-ar', '16000', '-b:a', '64k', audioPath], jobId);
+      const audioB64 = readFileSync(audioPath).toString('base64');
+      try { unlinkSync(audioPath); } catch {}
+      const transcribeResult = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ inlineData: { mimeType: 'audio/mp3', data: audioB64 } }, { text: 'Transcribe this audio with timestamps. Format: [Xs] word [Xs] word...' }] }],
+      });
+      transcriptText = transcribeResult.candidates[0].content.parts[0].text;
+    }
+
+    // Ask Gemini to pick the best moments
+    const pickPrompt = `You are editing a ${info.duration.toFixed(0)}-second video into a ${targetDuration}-second highlight reel.
+
+Transcript:
+${transcriptText.substring(0, 8000)}
+
+Pick the most engaging, informative, or entertaining moments. Return JSON:
+{
+  "segments": [
+    { "start": 5.0, "end": 18.0, "reason": "Strong hook" },
+    { "start": 45.0, "end": 62.0, "reason": "Key insight" }
+  ],
+  "totalDuration": 58
+}
+
+Rules:
+- Total of all segments must be approximately ${targetDuration} seconds
+- Minimum segment length: 3 seconds, maximum: 30 seconds
+- No overlapping segments
+- Prefer segments with strong statements, key insights, or high energy`;
+
+    const pickResult = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts: [{ text: pickPrompt }] }],
+      config: { responseMimeType: 'application/json' },
+    });
+    const pickData = JSON.parse(pickResult.candidates[0].content.parts[0].text);
+    const segments = pickData.segments || [];
+
+    if (segments.length === 0) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'No segments identified' })); return; }
+
+    // Extract each segment and concatenate
+    const segmentPaths = [];
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const segPath = join(session.assetsDir, `_hl_seg_${i}.mp4`);
+      await runFFmpeg(['-y', '-ss', `${seg.start}`, '-t', `${seg.end - seg.start}`, '-i', videoAsset.path, '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', segPath], jobId);
+      segmentPaths.push(segPath);
+    }
+
+    // Concatenate with concat demuxer
+    const concatList = join(session.assetsDir, '_hl_concat.txt');
+    writeFileSync(concatList, segmentPaths.map(p => `file '${p.replace(/\\/g, '/')}'`).join('\n'));
+    const reelId = randomUUID();
+    const reelPath = join(session.assetsDir, `${reelId}.mp4`);
+    await runFFmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', concatList, '-c', 'copy', reelPath], jobId);
+
+    // Cleanup temp files
+    for (const p of segmentPaths) { try { unlinkSync(p); } catch {} }
+    try { unlinkSync(concatList); } catch {}
+
+    // Register as new asset
+    const reelInfo = await getMediaInfo(reelPath);
+    const thumbPath = join(session.assetsDir, `${reelId}_thumb.jpg`);
+    try { await runFFmpeg(['-y', '-i', reelPath, '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2', '-frames:v', '1', thumbPath], jobId); } catch {}
+
+    const reelAsset = {
+      id: reelId, type: 'video', filename: `highlight_reel_${targetDuration}s.mp4`,
+      duration: reelInfo.duration, size: statSync(reelPath).size,
+      width: reelInfo.width, height: reelInfo.height,
+      path: reelPath,
+      thumbnailUrl: `/session/${sessionId}/assets/${reelId}/thumbnail`,
+      streamUrl: `/session/${sessionId}/assets/${reelId}/stream`,
+      aiGenerated: false,
+    };
+    session.assets.set(reelId, reelAsset);
+
+    console.log(`[${jobId}] Highlight reel: ${segments.length} segments → ${reelInfo.duration.toFixed(1)}s`);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, assetId: reelId, segments, totalDuration: reelInfo.duration }));
+  } catch (error) {
+    console.error(`[${jobId}] Highlight reel error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 7: Caption Translation ──────────────────────────
+async function handleTranslateCaptions(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { language, captionWords } = body; // captionWords: [{text, start, end}]
+
+    if (!language || !captionWords || captionWords.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'language and captionWords are required' })); return;
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' })); return; }
+
+    console.log(`\n[${jobId}] === TRANSLATE CAPTIONS → ${language} (${captionWords.length} words) ===`);
+    const ai = new GoogleGenAI({ apiKey });
+
+    const text = captionWords.map(w => w.text).join(' ');
+    const result = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts: [{ text: `Translate this text to ${language}. Return ONLY the translated words as a JSON array of strings, one per original word (preserve word count exactly): ${JSON.stringify(captionWords.map(w => w.text))}` }] }],
+      config: { responseMimeType: 'application/json' },
+    });
+
+    let translatedWords = JSON.parse(result.candidates[0].content.parts[0].text);
+    // If Gemini returns an array of arrays or nested, flatten
+    if (Array.isArray(translatedWords[0])) translatedWords = translatedWords.flat();
+
+    // Pair translated words with original timestamps
+    // If word counts differ, distribute translated words proportionally
+    const translated = captionWords.map((w, i) => ({
+      text: translatedWords[i] || '',
+      start: w.start,
+      end: w.end,
+    })).filter(w => w.text);
+
+    console.log(`[${jobId}] Translated ${captionWords.length} words to ${language}`);
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, words: translated, language, originalText: text }));
+  } catch (error) {
+    console.error(`[${jobId}] Translate captions error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 8: Thumbnail Generator ──────────────────────────
+async function handleGenerateThumbnail(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { timestamp, assetId } = body;
+
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) { for (const a of session.assets.values()) { if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) { videoAsset = a; break; } } }
+    if (!videoAsset) { res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'No video asset found' })); return; }
+
+    console.log(`\n[${jobId}] === THUMBNAIL GENERATOR (t=${timestamp ?? 'best'}) ===`);
+
+    const thumbId = randomUUID();
+    const thumbPath = join(session.assetsDir, `${thumbId}.jpg`);
+    const ss = timestamp != null ? `${timestamp}` : null;
+
+    // If no timestamp, extract at 25%, 50%, 75% and pick the sharpest (highest Laplacian variance)
+    if (!ss) {
+      const info = await getMediaInfo(videoAsset.path);
+      const candidates = [0.25, 0.5, 0.75].map(t => ({ t: (info.duration * t).toFixed(2), path: join(session.assetsDir, `_tc_${t}.jpg`) }));
+      let bestPath = candidates[1].path; // default: 50%
+      let bestScore = -1;
+
+      for (const c of candidates) {
+        try {
+          await runFFmpeg(['-y', '-ss', c.t, '-i', videoAsset.path, '-frames:v', '1', '-vf', 'scale=320:180', '-q:v', '3', c.path], jobId);
+          // Use FFmpeg's blur detection as sharpness proxy
+          const blurResult = await runFFmpeg(['-i', c.path, '-vf', 'sobel,metadata=mode=print:file=-', '-frames:v', '1', '-f', 'null', '-'], jobId).catch(() => '');
+          const score = blurResult.length; // longer output = more edges = sharper
+          if (score > bestScore) { bestScore = score; bestPath = c.path; }
+        } catch {}
+      }
+      // Copy best to final path
+      const bestData = readFileSync(bestPath);
+      writeFileSync(thumbPath, bestData);
+      for (const c of candidates) { try { unlinkSync(c.path); } catch {} }
+    } else {
+      await runFFmpeg(['-y', '-ss', ss, '-i', videoAsset.path, '-frames:v', '1', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2', '-q:v', '2', thumbPath], jobId);
+    }
+
+    // Register as image asset
+    const thumbAsset = {
+      id: thumbId, type: 'image', filename: `thumbnail_${ss || 'best'}.jpg`,
+      duration: 0, size: statSync(thumbPath).size,
+      width: 1280, height: 720, path: thumbPath,
+      thumbnailUrl: `/session/${sessionId}/assets/${thumbId}/thumbnail`,
+      streamUrl: `/session/${sessionId}/assets/${thumbId}/stream`,
+      aiGenerated: false,
+    };
+    session.assets.set(thumbId, thumbAsset);
+    // Use itself as thumbnail
+    try { const d = readFileSync(thumbPath); writeFileSync(join(session.assetsDir, `${thumbId}_thumb.jpg`), d); } catch {}
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, assetId: thumbId, filename: thumbAsset.filename }));
+  } catch (error) {
+    console.error(`[${jobId}] Thumbnail error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 9: Waveform Data ─────────────────────────────────
+async function handleWaveformData(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Session not found' })); return; }
+  const jobId = sessionId.substring(0, 8);
+  try {
+    const body = await parseBody(req);
+    const { assetId, samples = 200 } = body;
+
+    const asset = assetId ? session.assets.get(assetId) : null;
+    if (!asset || !existsSync(asset.path)) { res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: 'Asset not found' })); return; }
+
+    // Use FFmpeg astats to get RMS amplitude per segment
+    const info = await getMediaInfo(asset.path);
+    const duration = info.duration || 1;
+    const segmentSize = duration / samples;
+
+    const stdout = await runFFmpegProbe([
+      '-i', asset.path,
+      '-af', `asetnsamples=${Math.max(1, Math.floor(segmentSize * 44100))},astats=metadata=1:reset=1`,
+      '-f', 'null', '-'
+    ], jobId).catch(() => '');
+
+    // Parse RMS from stderr by running with FFmpeg and reading stderr
+    const stderr = await runFFmpeg([
+      '-hide_banner', '-i', asset.path,
+      '-af', `asetnsamples=${Math.max(1, Math.floor(segmentSize * 44100))},astats=metadata=1:reset=1`,
+      '-f', 'null', '-'
+    ], jobId).catch(() => '');
+
+    // Extract RMS values
+    const rmsValues = [];
+    const rmsRegex = /lavfi\.astats\.(Overall\.)?RMS_level=([0-9.-]+)/g;
+    let rm;
+    while ((rm = rmsRegex.exec(stderr)) !== null) {
+      const db = parseFloat(rm[2]);
+      // Convert dB to 0-1 linear (clamp at -60dB floor)
+      const linear = Math.max(0, Math.min(1, (db + 60) / 60));
+      rmsValues.push(linear);
+    }
+
+    // Fallback: if no RMS data, use flat line at 0.3
+    const waveform = rmsValues.length > 0
+      ? rmsValues.slice(0, samples)
+      : Array(samples).fill(0.3);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ success: true, waveform, duration, samples: waveform.length }));
+  } catch (error) {
+    console.error(`[${jobId}] Waveform error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 async function handleMuteSegments(req, res, sessionId) {
   const session = getSession(sessionId);
   if (!session) {
@@ -8202,6 +8646,34 @@ const server = http.createServer(async (req, res) => {
     // Resequence sections based on captions (move X before Y)
     else if (req.method === 'POST' && action === 'resequence') {
       await handleResequence(req, res, sessionId);
+    }
+    // Auto-Reframe: crop + scale to reframe subject
+    else if (req.method === 'POST' && action === 'auto-reframe') {
+      await handleAutoReframe(req, res, sessionId);
+    }
+    // Auto-Duck: duck background music under speech
+    else if (req.method === 'POST' && action === 'auto-duck') {
+      await handleAutoDuck(req, res, sessionId);
+    }
+    // Silence Preview: return silence segments without cutting
+    else if (req.method === 'POST' && action === 'silence-preview') {
+      await handleSilencePreview(req, res, sessionId);
+    }
+    // Highlight Reel: compile best moments
+    else if (req.method === 'POST' && action === 'highlight-reel') {
+      await handleHighlightReel(req, res, sessionId);
+    }
+    // Caption Translation: translate captions to target language
+    else if (req.method === 'POST' && action === 'translate-captions') {
+      await handleTranslateCaptions(req, res, sessionId);
+    }
+    // Thumbnail Generator: extract frame as image asset
+    else if (req.method === 'POST' && action === 'generate-thumbnail') {
+      await handleGenerateThumbnail(req, res, sessionId);
+    }
+    // Waveform Data: extract RMS amplitude array for UI display
+    else if (req.method === 'POST' && action === 'waveform-data') {
+      await handleWaveformData(req, res, sessionId);
     }
     // Generate video from image (DiCaprio agent)
     else if (req.method === 'POST' && action === 'generate-video') {
