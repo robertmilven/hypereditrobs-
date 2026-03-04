@@ -8440,25 +8440,27 @@ async function handleProcessAsset(req, res, sessionId) {
 
     await runFFmpeg(ffmpegArgs, jobId);
 
-    // Replace original file in-place — clip's assetId stays the same, refreshAssets() cache-busts the URL
-    renameSync(outputPath, asset.path);
+    // On Windows, the browser holds a read lock on the original file while streaming,
+    // so renameSync over it fails with EPERM. Instead, update asset.path to point to
+    // the new output file — same assetId, different physical file on disk.
+    // The old file is left as an orphan (no longer referenced by the session).
 
-    // Regenerate thumbnail
+    // Regenerate thumbnail from the new output file
     await runFFmpeg([
-      '-y', '-i', asset.path,
+      '-y', '-i', outputPath,
       '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
       '-frames:v', '1',
       thumbPath
     ], jobId);
 
-    // Update asset metadata
+    // Update asset metadata — path now points to the new output file
     const { stat } = await import('fs/promises');
-    const stats = await stat(asset.path);
+    const stats = await stat(outputPath);
 
     let duration = asset.duration;
     try {
       const durationStr = execSync(
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${asset.path}"`,
+        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${outputPath}"`,
         { encoding: 'utf-8' }
       ).trim();
       duration = parseFloat(durationStr) || asset.duration;
@@ -8466,9 +8468,10 @@ async function handleProcessAsset(req, res, sessionId) {
       console.warn(`[${jobId}] Could not get duration:`, e.message);
     }
 
-    // Update the existing asset entry in-place
+    // Update the existing asset entry — same assetId, path now points to the edited file
     session.assets.set(assetId, {
       ...asset,
+      path: outputPath,
       duration,
       size: stats.size,
       thumbPath,
