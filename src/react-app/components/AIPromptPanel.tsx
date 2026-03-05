@@ -1450,6 +1450,20 @@ export default function AIPromptPanel({
       return 'edit-animation';
     }
 
+    // Camera movement on the actual video → FFmpeg, BUT only for simple action phrases.
+    // Rich scene descriptions (neon lighting, holographic, glitch art, detailed environments)
+    // are animation requests even if they mention camera movement words like "dolly" or "pan".
+    const isRichSceneDescription = lower.includes('holographic') || lower.includes('neon') ||
+      lower.includes('glitch') || lower.includes('futuristic') || lower.includes('cityscape') ||
+      lower.includes('landscape') || lower.includes('aesthetic') || lower.includes('lighting') ||
+      lower.includes('metropolis') || lower.includes('hyper') || lower.includes('stylized') ||
+      lower.includes('cinematic scene') || lower.includes('miniature') ||
+      (lower.split(' ').length > 20); // very long descriptive prompt = animation intent
+    if (isCameraMovement && !isRichSceneDescription &&
+        (ctx.hasTimeRange || lower.includes('transition') || lower.includes('effect'))) {
+      return 'ffmpeg-edit';
+    }
+
     // ============================================
     // INTENT-BASED DECISIONS (when not in edit tab)
     // ============================================
@@ -2406,9 +2420,16 @@ export default function AIPromptPanel({
     // Debug: log what time values we received
     console.log('[DEBUG] handleCustomAnimationWorkflow called with:', JSON.stringify({ description: description.substring(0, 50), startTimeOverride, endTimeOverride, requestedDuration }));
 
-    // When a time range is specified, use the contextual workflow with approval step
-    // This analyzes the video content and shows scenes for user review before rendering
-    if (startTimeOverride !== undefined && onAnalyzeForAnimation) {
+    // Rich creative descriptions should go straight to direct rendering — they are a
+    // full visual brief, not a request to analyse video content at a timestamp.
+    // Detect by length (>15 words) OR presence of specific design/scene vocabulary.
+    const words = description.trim().split(/\s+/);
+    const hasRichCreativeBrief = words.length > 15 ||
+      /holographic|neon|glitch|cinematic|futuristic|cityscape|metropolis|hyper.?lapse|stylized|aestheti|miniature|lens|vignette|bokeh|parallax|chromatic|particle|ethereal|surreal|dystopian/i.test(description);
+
+    // When a time range is specified AND no rich creative brief, use the contextual workflow
+    // with approval step — this analyses the video content and shows scenes for user review.
+    if (startTimeOverride !== undefined && onAnalyzeForAnimation && !hasRichCreativeBrief) {
       setIsProcessing(true);
       setProcessingStatus('Analyzing video content...');
 

@@ -8357,7 +8357,8 @@ async function handleProcessAsset(req, res, sessionId) {
 
   try {
     const body = await parseBody(req);
-    const { assetId, command } = body;
+    const { assetId } = body;
+    let command = body.command;
 
     if (!assetId || !command) {
       res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -8392,6 +8393,258 @@ async function handleProcessAsset(req, res, sessionId) {
     console.log(`\n[${jobId}] === PROCESS ASSET WITH FFMPEG ===`);
     console.log(`[${jobId}] Source: ${asset.filename}`);
     console.log(`[${jobId}] Command: ${command}`);
+
+    // Auto-fix split/asplit filter output count.
+    // Gemini often generates `split[a][b][c]` but the filter defaults to 2 outputs.
+    // We count the bracketed labels and inject `=N` when it's missing.
+    command = command.replace(/\b(a?split)\b((?:\[[^\]]+\]){2,})/g, (match, filterName, labelStr) => {
+      const labels = (labelStr.match(/\[[^\]]+\]/g) || []);
+      if (labels.length > 2) {
+        return `${filterName}=${labels.length}${labelStr}`;
+      }
+      return match;
+    });
+
+    // Fix zoompan d=N (N > 1): d is "output frames per input frame" — d=500 on a
+    // 12-min video generates 500 × frames = ~121 hours of output. For smooth
+    // continuous animation using the `on` counter, d=1 is always correct.
+    command = command.replace(/zoompan=([^";\n]*?)d=(\d+)/g, (match, params, d) => {
+      if (parseInt(d, 10) > 1) {
+        console.log(`[${jobId}] Fixed zoompan d=${d}→1 (was generating ${d} frames per input frame)`);
+        return `zoompan=${params}d=1`;
+      }
+      return match;
+    });
+
+    // Remove large intermediate upscale before zoompan (e.g. scale=8000:-1,zoompan).
+    // Upscaling a 1080p video to 8000px just for zoom quality is ~17× slower with
+    // negligible visual benefit for standard 1920×1080 output.
+    command = command.replace(/scale=\d{4,}:-\d+,(\s*zoompan)/g, '$1');
+
+    // Replace zoompan=... with equivalent scale+crop.
+    // zoompan with expression-based x/y coordinates consistently produces frame=0 on
+    // this FFmpeg build (Windows) — the filter initialises but emits no output frames.
+    // scale+crop achieves the same visual result and is battle-tested reliable.
+    //
+    //   zoompan=z=Z:x=XEXPR:y=YEXPR:d=1[:s=WxH]
+    //   →  scale=iw*Z:ih*Z, crop=W:H:x='(in_w-W)*t/D':y='(in_h-H)*(1-t/D)'
+    //
+    // The crop pans diagonally (top-left → bottom-right) over duration D seconds,
+    // which matches the typical "slow diagonal pan" intent Gemini requests.
+    const replaceZoompanInVf = (vf, duration) => {
+      if (!vf || !vf.includes('zoompan')) return vf;
+
+      // Quote-aware extraction: scan char-by-char so commas inside 'min(1.8, ...)' are
+      // not treated as filter separators (a plain [^,;]+ regex stops at those commas).
+      const zpStart = vf.indexOf('zoompan=');
+      if (zpStart === -1) return vf;
+      let i = zpStart + 'zoompan='.length;
+      let inQuote = false;
+      while (i < vf.length) {
+        const c = vf[i];
+        if (c === "'") { inQuote = !inQuote; }
+        else if (!inQuote && (c === ',' || c === ';' || c === '[')) { break; }
+        i++;
+      }
+      const zpParams = vf.substring(zpStart + 'zoompan='.length, i);
+
+      // Extract z (zoom factor). Try bare number first, then first number inside quotes.
+      const zNumM = zpParams.match(/(?:^|:)z=([\d.]+)/);
+      const zExprM = zpParams.match(/(?:^|:)z='[^']*?([\d.]+)/);
+      const rawZ = zNumM ? parseFloat(zNumM[1]) : zExprM ? parseFloat(zExprM[1]) : 1.8;
+      // Enforce minimum 1.6 — 1.2x is imperceptible; 1.6–2.0x is cinematic.
+      const zVal = Math.max(rawZ, 1.6);
+
+      // Extract output dimensions from s=WxH (default 1920x1080).
+      const sM = zpParams.match(/:s=(\d+)x(\d+)/);
+      const outW = sM ? parseInt(sM[1]) : 1920;
+      const outH = sM ? parseInt(sM[2]) : 1080;
+
+      const d = Math.max(duration, 0.1);
+
+      // Detect intent: CENTER ZOOM if zoompan x/y expression uses `zoom` as a variable
+      // for centering (e.g. x='iw/2-(iw/zoom)/2'). DIRECTIONAL PAN otherwise.
+      // Also detect short variable 'z' used as zoom divisor for centering: iw/2-(iw/z/2)
+      const isCenterZoom = zpParams.includes('/zoom') || zpParams.includes('zoom/')
+        || zpParams.includes('iw/z') || zpParams.includes('ih/z')
+        || zpParams.includes('/z/') || zpParams.includes('/z)');
+
+      let replacement;
+      if (isCenterZoom) {
+        // Progressive center zoom: crop a shrinking centred window, scale back to outWxoutH.
+        // Zoom factor ramps from 1.0 at t=0 to zVal at t=d.
+        // crop w/h are time-varying expressions; x/y always centre the crop window.
+        const zoomRate = ((zVal - 1) / d).toFixed(6);
+        replacement = `crop=w='iw/(1+${zoomRate}*t)':h='ih/(1+${zoomRate}*t)':x='(in_w-out_w)/2':y='(in_h-out_h)/2',scale=${outW}:${outH}`;
+        console.log(`[${jobId}] zoompan→center zoom (1x→${zVal}x over ${d}s)`);
+      } else {
+        // Directional pan: scale up by zVal, then slide crop window diagonally.
+        replacement = `scale=iw*${zVal}:ih*${zVal},crop=${outW}:${outH}:x='min((in_w-${outW})*t/${d},in_w-${outW})':y='max((in_h-${outH})*(1-t/${d}),0)'`;
+        console.log(`[${jobId}] zoompan→diagonal pan (z=${zVal} over ${d}s)`);
+      }
+
+      // Strip any large preceding upscale (e.g. scale=8000:-1) that was paired with zoompan
+      const leadingScaleRe = /scale=\d{4,}:-?\d+,\s*$/;
+      const beforeZp = vf.substring(0, zpStart);
+      const leadingM = beforeZp.match(leadingScaleRe);
+      const replStart = leadingM ? zpStart - leadingM[0].length : zpStart;
+      return vf.substring(0, replStart) + replacement + vf.substring(i);
+    };
+
+    // Apply zoompan→scale+crop replacement to plain -vf commands (no range detection)
+    // so simple "add zoom" prompts also work reliably.
+    // IMPORTANT: skip this when the command has -ss + -to — those go through
+    // buildRangedConcat which calls replaceZoompanInVf with the correct segment
+    // duration (t1-t0). Running it here first would bake in asset.duration (e.g. 727s)
+    // so a 30-second segment barely moves over its actual duration.
+    {
+      const simpleVfM = command.match(/-vf\s+"([^"]+)"/);
+      const isRangedCmd = /-ss\s+[\d:.]+/.test(command) && /(?:^|\s)-to\s+[\d:.]+/.test(command);
+      if (simpleVfM && simpleVfM[1].includes('zoompan') && !command.includes('-filter_complex') && !isRangedCmd) {
+        const newVf = replaceZoompanInVf(simpleVfM[1], asset.duration || 60);
+        command = command.replace(/-vf\s+"[^"]+"/, `-vf "${newVf}"`);
+      }
+    }
+
+    // Helper: rebuild a ranged effect as a multi-input concat.
+    // Uses separate -i input.mp4 instances with -ss/-t seeking for each segment so
+    // each gets its own clean decode context. This avoids the trim-filter PTS/format
+    // bugs that cause the after-segment to freeze on the last effect frame.
+    const parseTs = (s) => {
+      const parts = s.split(':').map(Number);
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      return parseFloat(s);
+    };
+    const buildRangedConcat = (t0, t1, vf, af) => {
+      const dur = asset.duration || 0;
+      // Guard: range entirely past end → apply effect to whole video
+      if (dur > 0 && t0 >= dur - 0.1) {
+        console.log(`[${jobId}] Ranged t0=${t0}s >= duration=${dur}s — effect applied to whole video`);
+        const cmd = `ffmpeg -y -i input.mp4${vf ? ` -vf "${vf}"` : ''}${af ? ` -af "${af}"` : ''} -c:v libx264 -c:a aac output.mp4`;
+        return cmd;
+      }
+      const hasPrefix = t0 > 0.05;
+      const hasSuffix = dur > 0 ? t1 < dur - 0.1 : true;
+
+      // Fix rotate canvas expansion (would cause dimension mismatch in concat)
+      if (vf.match(/\brotate\b/) && !vf.includes('ow=')) {
+        vf = vf.replace(/(\brotate=[^,\s]+)/, '$1:ow=iw:oh=ih');
+      }
+
+      // NB_FRAMES is unavailable inside filter_complex (evaluates to 0), turning
+      // expressions like n/(NB_FRAMES-1) into n/(-1) → huge negative crop coords → zero output.
+      // Replace with the actual segment frame count before building the filter graph.
+      if (vf.includes('NB_FRAMES')) {
+        const frameCount = Math.round((t1 - t0) * (asset.fps || 30));
+        vf = vf.replace(/NB_FRAMES/g, String(frameCount));
+      }
+
+      // Transition effects (whip pan, flash, etc.) — auto-cap to 0.8s and centre on t0.
+      // avgblur with large sizeX is a horizontal smear/whip pan effect. Applying it for
+      // 20 seconds produces a long blurry segment, not a transition. Cap it so the blur
+      // fires only for 0.8s at the start of the user's specified range, then the video
+      // resumes normally. This is the correct cinematic behaviour for a whip pan.
+      const sizeXMatch = vf.match(/avgblur[^,]*sizeX=(\d+)/);
+      const isTransitionEffect = sizeXMatch && parseInt(sizeXMatch[1]) >= 100;
+      if (isTransitionEffect && (t1 - t0) > 1.0) {
+        console.log(`[${jobId}] Transition effect (avgblur sizeX=${sizeXMatch[1]}) — auto-capping from ${(t1-t0).toFixed(1)}s to 0.8s`);
+        t1 = t0 + 0.8;
+      }
+
+      // Replace zoompan with scale+crop (zoompan produces frame=0 in filter_complex
+      // with expression-based coordinates on this FFmpeg build).
+      vf = replaceZoompanInVf(vf, t1 - t0);
+
+      // Build list of input file references with seek params.
+      // Multiple -i input.mp4 entries — the tokenizer replaces each with asset.path.
+      const inputArgs = [];
+      const filterParts = [];
+      const segInputs = [];
+      let iIdx = 0; // input index
+      let sIdx = 0; // segment index
+
+      // All segments must share the same pixel format AND dimensions for concat to work.
+      // - format=yuv420p: phone video is often yuvj420p; scale/crop output yuv420p
+      // - scaleNorm: if the effect's vf includes scale=W:H or crop=W:H with numeric
+      //   dimensions, apply the same scale to before/after so all segments match.
+      // - format=yuv420p BEFORE user's filters: normalise input pixel format first.
+      // aformat=sample_fmts=fltp normalises audio sample format for concat.
+      //
+      // Check scale= AND crop= for numeric output dimensions (last one wins —
+      // that is the final output resolution of the effect segment).
+      const allSizeMatches = [...(vf || '').matchAll(/\b(?:scale|crop)=(\d+):(\d+)\b/g)];
+      const lastSize = allSizeMatches.length > 0 ? allSizeMatches[allSizeMatches.length - 1] : null;
+      const scaleNorm = lastSize ? `scale=${lastSize[1]}:${lastSize[2]},` : '';
+
+      if (hasPrefix) {
+        inputArgs.push(`-t ${t0} -i input.mp4`);
+        filterParts.push(`[${iIdx}:v]setpts=PTS-STARTPTS,${scaleNorm}format=yuv420p[v${sIdx}]`);
+        filterParts.push(`[${iIdx}:a]asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp[a${sIdx}]`);
+        segInputs.push(`[v${sIdx}][a${sIdx}]`); iIdx++; sIdx++;
+      }
+
+      inputArgs.push(`-ss ${t0} -t ${t1 - t0} -i input.mp4`);
+      // format=yuv420p injected before AND after user's filter chain:
+      // before = normalise input for filters like zoompan that require yuv420p
+      // after  = normalise output so concat dimensions/format match before/after segments
+      const midV = vf ? `setpts=PTS-STARTPTS,format=yuv420p,${vf},format=yuv420p` : `setpts=PTS-STARTPTS,${scaleNorm}format=yuv420p`;
+      const midA = af ? `asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp,${af}` : `asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp`;
+      filterParts.push(`[${iIdx}:v]${midV}[v${sIdx}]`);
+      filterParts.push(`[${iIdx}:a]${midA}[a${sIdx}]`);
+      segInputs.push(`[v${sIdx}][a${sIdx}]`); iIdx++; sIdx++;
+
+      if (hasSuffix) {
+        inputArgs.push(`-ss ${t1} -i input.mp4`);
+        filterParts.push(`[${iIdx}:v]setpts=PTS-STARTPTS,${scaleNorm}format=yuv420p[v${sIdx}]`);
+        filterParts.push(`[${iIdx}:a]asetpts=PTS-STARTPTS,aformat=sample_fmts=fltp[a${sIdx}]`);
+        segInputs.push(`[v${sIdx}][a${sIdx}]`); iIdx++; sIdx++;
+      }
+
+      const n = segInputs.length;
+      filterParts.push(`${segInputs.join('')}concat=n=${n}:v=1:a=1[vout][aout]`);
+      const cmd = `ffmpeg -y ${inputArgs.join(' ')} -filter_complex "${filterParts.join('; ')}" -map "[vout]" -map "[aout]" -c:v libx264 -c:a aac output.mp4`;
+      console.log(`[${jobId}] Ranged effect (${t0}s–${t1}s) → ${n}-part multi-input concat: ${cmd}`);
+      return cmd;
+    };
+
+    // Pattern 1: Gemini uses -ss + -to + -vf/-af (extracts only that segment)
+    const ssM = command.match(/-ss\s+([\d:.]+)/);
+    const toM = command.match(/(?:^|\s)-to\s+([\d:.]+)/);
+    const vfM = command.match(/-vf\s+"([^"]+)"/);
+    const afM = command.match(/-af\s+"([^"]+)"/);
+    const hasAnFlag = /-an\b/.test(command);
+
+    if (ssM && toM && (vfM || afM) && !hasAnFlag && !command.includes('-filter_complex')) {
+      const t0 = parseTs(ssM[1]);
+      const t1 = parseTs(toM[1]);
+      command = buildRangedConcat(t0, t1, vfM ? vfM[1] : '', afM ? afM[1] : '');
+    }
+
+    // Pattern 2: Gemini uses enable='between(t,T0,T1)' inside -vf (unsupported by most filters)
+    if (!command.includes('-filter_complex') && !ssM) {
+      const enableMatch = command.match(/enable='between\(t,([\d.]+),([\d.]+)\)'/);
+      const vfRawMatch = command.match(/-vf\s+"([^"]+)"/);
+      if (enableMatch && vfRawMatch) {
+        const t0e = parseFloat(enableMatch[1]);
+        const t1e = parseFloat(enableMatch[2]);
+        // Strip enable clause and fix (t-T0) → t since each segment's t resets to 0
+        let cleanVf = vfRawMatch[1]
+          .replace(/:?enable='between\(t,[^)]+\)'/, '')
+          .replace(new RegExp(`\\(t-${t0e}\\)`, 'g'), 't');
+        command = buildRangedConcat(t0e, t1e, cleanVf, '');
+      }
+    }
+
+    // Ensure explicit codec flags for filter_complex commands targeting mp4 output.
+    // Without -c:v/-c:a, FFmpeg auto-selects but fails to init the AAC encoder
+    // (EINVAL / "Invalid argument") on some builds when receiving filtered streams.
+    if (/-filter_complex\b/.test(command) && /output\.mp4/.test(command)) {
+      if (!/-c:v\b/.test(command) && !/-codec:v\b/.test(command)) {
+        command = command.replace(/output\.mp4/, '-c:v libx264 -c:a aac output.mp4');
+        console.log(`[${jobId}] Added codec flags to filter_complex command`);
+      }
+    }
 
     // Parse the FFmpeg command and replace input/output placeholders.
     // Use a shell-aware tokenizer so quoted filter strings (e.g. "afftdn=nf=-25")
