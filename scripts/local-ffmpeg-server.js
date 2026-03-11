@@ -13,20 +13,31 @@ import { fal } from '@fal-ai/client';
 
 // Load environment variables from .dev.vars
 function loadEnvVars() {
-  try {
-    const envPath = join(process.cwd(), '.dev.vars');
-    if (existsSync(envPath)) {
-      const content = readFileSync(envPath, 'utf-8');
-      for (const line of content.split('\n')) {
-        const [key, ...valueParts] = line.split('=');
-        if (key && valueParts.length > 0) {
-          process.env[key.trim()] = valueParts.join('=').trim();
+  // Check multiple locations for .dev.vars
+  const possiblePaths = [
+    join(process.cwd(), '.dev.vars'),
+    join(process.cwd(), '..', '.dev.vars'),  // Parent directory (when running from scripts/)
+    join(import.meta.dirname, '..', '.dev.vars'),  // Relative to this file
+  ];
+
+  for (const envPath of possiblePaths) {
+    try {
+      if (existsSync(envPath)) {
+        const content = readFileSync(envPath, 'utf-8');
+        for (const line of content.split('\n')) {
+          const [key, ...valueParts] = line.split('=');
+          if (key && valueParts.length > 0) {
+            process.env[key.trim()] = valueParts.join('=').trim();
+          }
         }
+        console.log(`Loaded environment from: ${envPath}`);
+        return;
       }
+    } catch (e) {
+      // Try next path
     }
-  } catch (e) {
-    console.warn('Could not load .dev.vars:', e.message);
   }
+  console.warn('Could not find .dev.vars in any expected location');
 }
 loadEnvVars();
 
@@ -34,6 +45,11 @@ loadEnvVars();
 // Map FAL_API_KEY to FAL_KEY for backward compatibility
 if (process.env.FAL_API_KEY && !process.env.FAL_KEY) {
   process.env.FAL_KEY = process.env.FAL_API_KEY;
+}
+// Explicitly configure fal.ai with credentials
+if (process.env.FAL_KEY) {
+  fal.config({ credentials: process.env.FAL_KEY });
+  console.log('fal.ai configured with API key');
 }
 
 const PORT = 3333;
@@ -2097,6 +2113,15 @@ async function handleProjectRender(req, res, sessionId) {
     const frameTemplate = session.project.frameTemplate;
     const overlayAssets = session.project.overlayAssets || [];
 
+    console.log(`[${sessionId}] Frame template:`, frameTemplate ? JSON.stringify(frameTemplate).substring(0, 200) : 'NONE');
+    console.log(`[${sessionId}] Overlay assets: ${overlayAssets.length} assets`);
+    if (frameTemplate && frameTemplate.overlays) {
+      console.log(`[${sessionId}] Frame template has ${frameTemplate.overlays.length} overlays`);
+      for (const ov of frameTemplate.overlays) {
+        console.log(`[${sessionId}]   Overlay: type=${ov.type}, assetId=${ov.assetId || 'none'}`);
+      }
+    }
+
     // Helper to write base64 data URL to temp file
     const writeBase64ToTempFile = (dataUrl, filename) => {
       const matches = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
@@ -2161,17 +2186,30 @@ async function handleProjectRender(req, res, sessionId) {
 
     // Handle image background
     if (frameTemplate && frameTemplate.background && frameTemplate.background.type === 'image' && frameTemplate.background.imageAssetId) {
-      const bgAsset = overlayAssets.find(a => a.id === frameTemplate.background.imageAssetId);
-      if (bgAsset && bgAsset.dataUrl) {
-        const tempPath = writeBase64ToTempFile(bgAsset.dataUrl, 'bg_image.png');
-        if (tempPath) {
-          inputs.push('-loop', '1', '-i', tempPath);
-          const bgIdx = inputIndex++;
-          // Scale image to fill frame
-          filterParts.push(`[${bgIdx}:v]scale=${settings.width}:${settings.height}:force_original_aspect_ratio=increase,crop=${settings.width}:${settings.height}[imgbg]`);
-          filterParts.push(`[base][imgbg]overlay=0:0[imgbase]`);
-          lastVideo = 'imgbase';
+      let bgPath = null;
+      const bgOverlayAsset = overlayAssets.find(a => a.id === frameTemplate.background.imageAssetId);
+
+      if (bgOverlayAsset && bgOverlayAsset.dataUrl) {
+        // Client sent base64 data
+        bgPath = writeBase64ToTempFile(bgOverlayAsset.dataUrl, 'bg_image.png');
+      } else if (session.assets && session.assets.has(frameTemplate.background.imageAssetId)) {
+        // Look up from session assets (server-side storage)
+        const sessionAsset = session.assets.get(frameTemplate.background.imageAssetId);
+        if (sessionAsset && sessionAsset.path && existsSync(sessionAsset.path)) {
+          bgPath = sessionAsset.path;
+          console.log(`[${sessionId}] Using session asset for background: ${bgPath}`);
         }
+      }
+
+      if (bgPath) {
+        inputs.push('-loop', '1', '-i', bgPath);
+        const bgIdx = inputIndex++;
+        // Scale image to fill frame
+        filterParts.push(`[${bgIdx}:v]scale=${settings.width}:${settings.height}:force_original_aspect_ratio=increase,crop=${settings.width}:${settings.height}[imgbg]`);
+        filterParts.push(`[base][imgbg]overlay=0:0[imgbase]`);
+        lastVideo = 'imgbase';
+      } else {
+        console.log(`[${sessionId}] Background image asset not found: ${frameTemplate.background.imageAssetId}`);
       }
     }
 
@@ -2251,22 +2289,52 @@ async function handleProjectRender(req, res, sessionId) {
         const yPos = Math.round(zoneTop + zoneHeight * (overlay.y / 100));
 
         if (overlay.type === 'logo' && overlay.assetId) {
-          // Find the overlay asset
-          const asset = overlayAssets.find(a => a.id === overlay.assetId);
-          if (asset && asset.dataUrl) {
-            const tempPath = writeBase64ToTempFile(asset.dataUrl, `logo_${overlayIdx}.png`);
-            if (tempPath) {
-              inputs.push('-loop', '1', '-i', tempPath);
-              const logoIdx = inputIndex++;
-              const scale = overlay.scale || 0.3;
-              const logoWidth = Math.round(settings.width * scale);
+          // Find the overlay asset - check overlayAssets array first, then session.assets
+          let assetPath = null;
+          const overlayAsset = overlayAssets.find(a => a.id === overlay.assetId);
+          console.log(`[${sessionId}] Looking for logo asset: ${overlay.assetId}`);
+          console.log(`[${sessionId}]   overlayAsset found: ${!!overlayAsset}, has dataUrl: ${!!(overlayAsset && overlayAsset.dataUrl)}`);
+          console.log(`[${sessionId}]   session.assets exists: ${!!session.assets}, has assetId: ${session.assets ? session.assets.has(overlay.assetId) : false}`);
+          if (session.assets) {
+            console.log(`[${sessionId}]   session.assets keys: ${Array.from(session.assets.keys()).join(', ')}`);
+          }
 
-              // Scale logo and overlay with timing
-              filterParts.push(`[${logoIdx}:v]scale=${logoWidth}:-1[logo${overlayIdx}]`);
-              filterParts.push(`[${lastVideo}][logo${overlayIdx}]overlay=x=${xPos}-w/2:y=${yPos}-h/2:enable='${enable}'[logoout${overlayIdx}]`);
-              lastVideo = `logoout${overlayIdx}`;
-              overlayIdx++;
+          if (overlayAsset && overlayAsset.dataUrl) {
+            // Client sent base64 data
+            assetPath = writeBase64ToTempFile(overlayAsset.dataUrl, `logo_${overlayIdx}.png`);
+          } else if (session.assets && session.assets.has(overlay.assetId)) {
+            // Look up from session assets (server-side storage)
+            const sessionAsset = session.assets.get(overlay.assetId);
+            console.log(`[${sessionId}]   sessionAsset: ${JSON.stringify(sessionAsset)}`);
+            if (sessionAsset && sessionAsset.path && existsSync(sessionAsset.path)) {
+              assetPath = sessionAsset.path;
+              console.log(`[${sessionId}] Using session asset for logo: ${assetPath}`);
+            } else {
+              console.log(`[${sessionId}]   sessionAsset path missing or doesn't exist: ${sessionAsset?.path}`);
             }
+          }
+
+          if (assetPath) {
+            // Handle different image types
+            const isGif = /\.gif$/i.test(assetPath);
+            if (isGif) {
+              // GIFs need ignore_loop to loop indefinitely
+              inputs.push('-ignore_loop', '0', '-i', assetPath);
+            } else {
+              // Regular images (PNG, JPG) need -loop 1
+              inputs.push('-loop', '1', '-i', assetPath);
+            }
+            const logoIdx = inputIndex++;
+            const scale = overlay.scale || 0.3;
+            const logoWidth = Math.round(settings.width * scale);
+
+            // Scale logo and overlay with timing
+            filterParts.push(`[${logoIdx}:v]scale=${logoWidth}:-1[logo${overlayIdx}]`);
+            filterParts.push(`[${lastVideo}][logo${overlayIdx}]overlay=x=${xPos}-w/2:y=${yPos}-h/2:enable='${enable}'[logoout${overlayIdx}]`);
+            lastVideo = `logoout${overlayIdx}`;
+            overlayIdx++;
+          } else {
+            console.log(`[${sessionId}] Logo asset not found: ${overlay.assetId}`);
           }
         } else if (overlay.type === 'text' && overlay.text) {
           // Use drawtext filter for text overlays
@@ -2279,30 +2347,167 @@ async function handleProjectRender(req, res, sessionId) {
           lastVideo = `textout${overlayIdx}`;
           overlayIdx++;
         } else if (overlay.type === 'video' && overlay.assetId) {
-          // Find the video overlay asset
-          const asset = overlayAssets.find(a => a.id === overlay.assetId);
-          if (asset && asset.dataUrl) {
-            const tempPath = writeBase64ToTempFile(asset.dataUrl, `vidoverlay_${overlayIdx}.mp4`);
-            if (tempPath) {
-              // For looping video overlays
-              if (overlay.loop) {
-                inputs.push('-stream_loop', '-1', '-i', tempPath);
-              } else {
-                inputs.push('-i', tempPath);
-              }
-              const vidIdx = inputIndex++;
-              const scale = overlay.scale || 0.4;
-              const vidWidth = Math.round(settings.width * scale);
+          // Find the video overlay asset - check overlayAssets array first, then session.assets
+          let assetPath = null;
+          const overlayAsset = overlayAssets.find(a => a.id === overlay.assetId);
 
-              // Scale video overlay and composite with timing
-              filterParts.push(`[${vidIdx}:v]scale=${vidWidth}:-1,setpts=PTS-STARTPTS[vidov${overlayIdx}]`);
-              filterParts.push(`[${lastVideo}][vidov${overlayIdx}]overlay=x=${xPos}-w/2:y=${yPos}-h/2:enable='${enable}'[vidovout${overlayIdx}]`);
-              lastVideo = `vidovout${overlayIdx}`;
-              overlayIdx++;
+          if (overlayAsset && overlayAsset.dataUrl) {
+            // Client sent base64 data
+            assetPath = writeBase64ToTempFile(overlayAsset.dataUrl, `vidoverlay_${overlayIdx}.mp4`);
+          } else if (session.assets && session.assets.has(overlay.assetId)) {
+            // Look up from session assets (server-side storage)
+            const sessionAsset = session.assets.get(overlay.assetId);
+            if (sessionAsset && sessionAsset.path && existsSync(sessionAsset.path)) {
+              assetPath = sessionAsset.path;
+              console.log(`[${sessionId}] Using session asset for video overlay: ${assetPath}`);
             }
+          }
+
+          if (assetPath) {
+            // For looping video overlays
+            if (overlay.loop) {
+              inputs.push('-stream_loop', '-1', '-i', assetPath);
+            } else {
+              inputs.push('-i', assetPath);
+            }
+            const vidIdx = inputIndex++;
+            const scale = overlay.scale || 0.4;
+            const vidWidth = Math.round(settings.width * scale);
+
+            // Scale video overlay and composite with timing
+            filterParts.push(`[${vidIdx}:v]scale=${vidWidth}:-1,setpts=PTS-STARTPTS[vidov${overlayIdx}]`);
+            filterParts.push(`[${lastVideo}][vidov${overlayIdx}]overlay=x=${xPos}-w/2:y=${yPos}-h/2:enable='${enable}'[vidovout${overlayIdx}]`);
+            lastVideo = `vidovout${overlayIdx}`;
+            overlayIdx++;
+          } else {
+            console.log(`[${sessionId}] Video overlay asset not found: ${overlay.assetId}`);
           }
         }
       }
+    }
+
+    // ===== RENDER CAPTIONS (T1 track) =====
+    // Get caption clips from T1 and render them as drawtext overlays
+    const captionClips = clips.filter(c => c.trackId === 'T1');
+    const captionData = session.project.captionData || {};
+
+    if (captionClips.length > 0) {
+      console.log(`[${sessionId}] Rendering ${captionClips.length} caption clips`);
+      renderDebugLines.push(`\nCaption clips: ${captionClips.length}`);
+
+      let captionIdx = 0;
+      for (const captionClip of captionClips) {
+        const clipCaptionData = captionData[captionClip.id];
+        if (!clipCaptionData || !clipCaptionData.words || clipCaptionData.words.length === 0) {
+          renderDebugLines.push(`  Skipping caption clip ${captionClip.id} - no words`);
+          continue;
+        }
+
+        const style = clipCaptionData.style || {};
+        const words = clipCaptionData.words;
+        const timeOffset = style.timeOffset || 0;
+
+        // Style settings with defaults
+        // Scale font size for output resolution - preview uses ~300px width, output is 1080px
+        // So we scale the fontSize by roughly 3x to maintain visual proportions
+        const baseFontSize = style.fontSize || 48;
+        const scaleFactor = settings.width / 360; // Approximate preview width
+        const fontSize = Math.round(baseFontSize * scaleFactor);
+
+        const fontColor = (style.color || '#ffffff').replace('#', '');
+        const strokeColor = (style.strokeColor || '#000000').replace('#', '');
+        // Scale stroke width proportionally
+        const baseStrokeWidth = style.strokeWidth || 3;
+        const strokeWidth = Math.round(baseStrokeWidth * scaleFactor);
+        const fontWeight = style.fontWeight || 'bold';
+        const position = style.position || 'bottom';
+        const animation = style.animation || 'none';
+        const highlightColor = (style.highlightColor || '#FFD700').replace('#', '');
+
+        console.log(`[${sessionId}] Caption style: fontSize=${fontSize} (base ${baseFontSize}, scale ${scaleFactor.toFixed(2)}), color=#${fontColor}, animation=${animation}`);
+
+        // Calculate Y position based on style.position
+        let yExpr;
+        if (position === 'top') {
+          yExpr = `h*0.15`;
+        } else if (position === 'center') {
+          yExpr = `(h-th)/2`;
+        } else {
+          // bottom - position in lower 20% for 9:16
+          yExpr = `h*0.80`;
+        }
+
+        // Font path (Windows)
+        const fontPath = fontWeight === 'black'
+          ? '/Windows/Fonts/arialbd.ttf'
+          : fontWeight === 'bold'
+            ? '/Windows/Fonts/arialbd.ttf'
+            : '/Windows/Fonts/arial.ttf';
+
+        renderDebugLines.push(`  Caption clip ${captionClip.id}: ${words.length} words, style=${JSON.stringify(style)}`);
+
+        // Group words into phrases (max 5 words or ~30 chars per phrase for readability)
+        const phrases = [];
+        let currentPhrase = [];
+        let currentLength = 0;
+        const MAX_WORDS = 5;
+        const MAX_CHARS = 30;
+
+        for (const word of words) {
+          if (currentPhrase.length >= MAX_WORDS ||
+              (currentLength + word.text.length > MAX_CHARS && currentPhrase.length > 0)) {
+            // Start new phrase
+            if (currentPhrase.length > 0) {
+              phrases.push([...currentPhrase]);
+            }
+            currentPhrase = [word];
+            currentLength = word.text.length;
+          } else {
+            currentPhrase.push(word);
+            currentLength += word.text.length + 1; // +1 for space
+          }
+        }
+        if (currentPhrase.length > 0) {
+          phrases.push(currentPhrase);
+        }
+
+        renderDebugLines.push(`  Grouped into ${phrases.length} phrases`);
+
+        // Render each phrase as a single drawtext
+        for (const phrase of phrases) {
+          const phraseText = phrase.map(w => w.text).join(' ');
+          const phraseStart = captionClip.start + phrase[0].start + timeOffset;
+          const phraseEnd = captionClip.start + phrase[phrase.length - 1].end + timeOffset;
+
+          // Escape special characters for FFmpeg drawtext
+          // Replace apostrophes/quotes with unicode equivalents to avoid shell escaping issues
+          const escapedText = phraseText
+            .replace(/\\/g, '')           // Remove backslashes
+            .replace(/'/g, '\u2019')      // Replace ' with unicode right single quote '
+            .replace(/"/g, '\u201D')      // Replace " with unicode right double quote "
+            .replace(/:/g, '\\:')
+            .replace(/\[/g, '\\[')
+            .replace(/\]/g, '\\]')
+            .replace(/%/g, '%%')          // Percent needs doubling in drawtext
+            .replace(/;/g, '\\;');        // Semicolon needs escaping
+
+          const enable = `between(t,${phraseStart.toFixed(3)},${phraseEnd.toFixed(3)})`;
+
+          // Use highlight color for karaoke animation, otherwise use regular font color
+          const textColor = animation === 'karaoke' ? highlightColor : fontColor;
+
+          // Build drawtext filter
+          // Center horizontally, position vertically based on style
+          const drawtextFilter = `drawtext=text='${escapedText}':fontsize=${fontSize}:fontcolor=0x${textColor}:fontfile='${fontPath}':x=(w-text_w)/2:y=${yExpr}:borderw=${strokeWidth}:bordercolor=0x${strokeColor}:enable='${enable}'`;
+
+          filterParts.push(`[${lastVideo}]${drawtextFilter}[cap${captionIdx}]`);
+          lastVideo = `cap${captionIdx}`;
+          captionIdx++;
+        }
+      }
+
+      console.log(`[${sessionId}] Added ${captionIdx} caption phrase filters`);
+      renderDebugLines.push(`Added ${captionIdx} caption phrase filters`);
     }
 
     // Rename final output
@@ -2410,14 +2615,24 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   const files = readdirSync(session.rendersDir);
 
   let renderFile;
+  let downloadFilename;
+
   if (renderType === 'preview') {
     renderFile = files.find(f => f === 'preview.mp4');
-  } else {
+    downloadFilename = 'preview.mp4';
+  } else if (renderType === 'export') {
     // Get most recent export
     renderFile = files
       .filter(f => f.startsWith('export-'))
       .sort()
       .pop();
+    downloadFilename = `${session.originalName.replace(/\.[^.]+$/, '')}-export.mp4`;
+  } else {
+    // Check if renderType is a specific filename (for scene exports)
+    if (files.includes(renderType)) {
+      renderFile = renderType;
+      downloadFilename = renderType;
+    }
   }
 
   if (!renderFile) {
@@ -2430,7 +2645,7 @@ async function handleRenderDownload(req, res, sessionId, renderType) {
   const { stat } = await import('fs/promises');
   const stats = await stat(renderPath);
 
-  const filename = renderType === 'preview' ? 'preview.mp4' : `${session.originalName.replace(/\.[^.]+$/, '')}-export.mp4`;
+  const filename = downloadFilename;
 
   res.writeHead(200, {
     'Content-Type': 'video/mp4',
@@ -3001,7 +3216,8 @@ async function checkLocalWhisper() {
 
 // Run local Whisper transcription
 async function runLocalWhisper(audioPath, jobId) {
-  const scriptPath = join(process.cwd(), 'scripts', 'whisper-transcribe.py');
+  // Use path relative to this file, not cwd (which may be scripts/ folder)
+  const scriptPath = join(import.meta.dirname, 'whisper-transcribe.py');
   const py = await getPythonBinary();
 
   return new Promise((resolve, reject) => {
@@ -3698,11 +3914,11 @@ async function analyzeBrollOpportunities(transcript, words, totalDuration, apiKe
       role: 'user',
       parts: [{
         text: `Analyze this video transcript and identify 3-5 key moments that would benefit from a visual B-roll image overlay. Consider:
-- Keywords or products mentioned (e.g., "iPhone", "Claude AI", "Tesla")
-- Funny or emphatic moments
-- Important concepts being explained
-- Brand names or people mentioned
-- Abstract concepts that could use visual reinforcement
+- Products, technology, or brands mentioned (e.g., "iPhone", "AI assistant", "Tesla")
+- Key concepts being explained that need visual reinforcement
+- Metaphors or analogies that could be illustrated
+- Emotional moments or reactions
+- Statistics or data points that could use visual support
 
 The video is ${totalDuration.toFixed(1)} seconds long.
 
@@ -3714,17 +3930,22 @@ Return a JSON array with this exact structure:
 [
   {
     "timestamp": 15.2,
-    "prompt": "minimalist icon of iPhone floating on clean white background, simple flat design",
+    "prompt": "professional photograph of a sleek modern smartphone on a minimal desk setup, soft studio lighting, shallow depth of field, 4K quality",
     "reason": "product mention",
     "keyword": "iPhone"
   }
 ]
 
-Guidelines for prompts:
-- Keep prompts concise (10-20 words)
-- Request clean, iconic, simple images suitable for video overlay
-- Use "minimalist", "icon", "simple", "flat design" style descriptors
-- Avoid complex scenes - prefer single subjects with clean backgrounds
+Guidelines for creating HIGH QUALITY image prompts:
+- Write detailed, descriptive prompts (20-40 words)
+- Request PHOTOREALISTIC or PROFESSIONAL PHOTOGRAPHY style
+- Include lighting details: "soft studio lighting", "golden hour", "dramatic lighting"
+- Include quality modifiers: "4K", "high resolution", "professional photograph", "cinematic"
+- Describe composition: "shallow depth of field", "centered subject", "clean background"
+- For tech: "sleek", "modern", "premium", "professional product shot"
+- For concepts: "artistic visualization", "creative representation", "symbolic imagery"
+- For people/emotions: "candid moment", "expressive", "authentic"
+- AVOID: "icon", "minimalist", "flat design", "simple" - we want RICH, DETAILED images
 - Images will be 1:1 square format
 
 IMPORTANT: Return ONLY valid JSON array, no markdown, no explanation.`
@@ -3753,54 +3974,56 @@ IMPORTANT: Return ONLY valid JSON array, no markdown, no explanation.`
   }
 }
 
-// Generate image using Gemini Imagen (Nano Banana)
+// Generate image using fal.ai (Flux model)
 async function generateImageWithGemini(prompt, apiKey, outputPath) {
-  const ai = new GoogleGenAI({ apiKey });
-
   console.log(`    Generating image: "${prompt.substring(0, 50)}..."`);
 
   try {
-    // Use Gemini's image generation model
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.0-flash-exp-image-generation',
-      contents: [{
-        role: 'user',
-        parts: [{
-          text: `Generate a clean, simple image: ${prompt}.
-Style: minimalist, iconic, suitable for video overlay.
-Format: 1:1 square aspect ratio.
-Background: clean, uncluttered.`
-        }]
-      }],
-      config: {
-        responseModalities: ['image', 'text'],
-      }
-    });
-
-    // Extract image from response
-    const parts = response.candidates?.[0]?.content?.parts || [];
-    console.log(`    Response has ${parts.length} parts`);
-
-    for (const part of parts) {
-      if (part.inlineData?.data) {
-        const imageBuffer = Buffer.from(part.inlineData.data, 'base64');
-        writeFileSync(outputPath, imageBuffer);
-        console.log(`    ✓ Image saved: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
-        return true;
-      }
-      if (part.text) {
-        console.log(`    Part contains text: "${part.text.substring(0, 100)}..."`);
-      }
+    // Use fal.ai Flux for image generation (more reliable than Gemini)
+    if (!process.env.FAL_KEY && !process.env.FAL_API_KEY) {
+      console.error(`    ✗ FAL_API_KEY not configured for image generation`);
+      return false;
     }
 
-    console.warn(`    ⚠️ No image data in response. Model may not support image generation.`);
-    console.warn(`    Response structure:`, JSON.stringify(response.candidates?.[0]?.content || {}).substring(0, 200));
+    // Use flux/dev for higher quality (slower but much better results)
+    const result = await fal.subscribe('fal-ai/flux/dev', {
+      input: {
+        prompt: `${prompt}. Professional quality, high resolution, suitable for video production.`,
+        image_size: 'square_hd',  // Higher resolution
+        num_images: 1,
+        guidance_scale: 3.5,  // Better prompt adherence
+        num_inference_steps: 28,  // More steps = higher quality
+      },
+      logs: false,
+    });
+
+    // Debug: log the response structure
+    console.log(`    fal.ai response keys: ${Object.keys(result || {}).join(', ')}`);
+
+    // Try different response structures
+    const images = result?.images || result?.data?.images || result?.output?.images || [];
+
+    if (images.length > 0) {
+      const imageUrl = images[0].url || images[0];
+      console.log(`    Downloading from: ${imageUrl.substring(0, 50)}...`);
+
+      // Download the image
+      const response = await fetch(imageUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to download image: ${response.status}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const imageBuffer = Buffer.from(arrayBuffer);
+      writeFileSync(outputPath, imageBuffer);
+      console.log(`    ✓ Image saved: ${(imageBuffer.length / 1024).toFixed(1)} KB`);
+      return true;
+    }
+
+    console.warn(`    ⚠️ No image in fal.ai response. Full response: ${JSON.stringify(result).substring(0, 300)}`);
     return false;
   } catch (error) {
     console.error(`    ✗ Image generation failed: ${error.message}`);
-    if (error.message.includes('not found') || error.message.includes('404')) {
-      console.error(`    The model 'gemini-2.0-flash-exp-image-generation' may not be available.`);
-    }
     return false;
   }
 }
@@ -3867,6 +4090,1081 @@ async function handleSceneDetect(req, res, sessionId) {
 
   } catch (error) {
     console.error(`[${jobId}] Scene detect error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Smart Scene Analysis (transcript + visual) ──────────────────────────────────
+async function handleAnalyzeScenes(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { assetId, includeVisualDetection = true } = body;
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && !asset.aiGenerated && existsSync(asset.path)) {
+          videoAsset = asset;
+          break;
+        }
+      }
+    }
+
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found in session' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === SMART SCENE ANALYSIS ===`);
+    console.log(`[${jobId}] Analyzing: ${videoAsset.filename}`);
+
+    // Step 1: Get transcript (use cache if available)
+    let transcription = session.transcriptCache?.get(videoAsset.id);
+    if (!transcription) {
+      console.log(`[${jobId}] Transcribing video...`);
+      transcription = await transcribeVideo(videoAsset.path, jobId);
+      if (!session.transcriptCache) session.transcriptCache = new Map();
+      session.transcriptCache.set(videoAsset.id, transcription);
+    } else {
+      console.log(`[${jobId}] Using cached transcript`);
+    }
+
+    if (!transcription || !transcription.words || transcription.words.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Could not transcribe video or transcript is empty' }));
+      return;
+    }
+
+    // Step 2: Optional visual scene detection
+    let visualScenes = [];
+    if (includeVisualDetection) {
+      console.log(`[${jobId}] Running visual scene detection...`);
+      try {
+        const stderr = await runFFmpeg([
+          '-hide_banner', '-i', videoAsset.path, '-an',
+          '-vf', "select='gt(scene,0.3)',showinfo",
+          '-f', 'null', '-'
+        ], jobId);
+
+        const regex = /\[Parsed_showinfo[^\]]*\][^\n]*pts_time:([\d.]+)/g;
+        let match;
+        while ((match = regex.exec(stderr)) !== null) {
+          const t = parseFloat(match[1]);
+          if (t > 0.5) visualScenes.push(t);
+        }
+        // Deduplicate within 1.5s
+        visualScenes = visualScenes.filter((t, i) =>
+          i === 0 || t - visualScenes[i - 1] > 1.5
+        );
+        console.log(`[${jobId}] Found ${visualScenes.length} visual scene cuts`);
+      } catch (e) {
+        console.log(`[${jobId}] Visual detection failed, continuing with transcript only:`, e.message);
+      }
+    }
+
+    // Step 3: Send to Gemini for topic-based scene detection
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+      return;
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+
+    // Build transcript with timestamps (sample every few words to keep prompt size manageable)
+    const formattedTranscript = transcription.words
+      .map(w => `[${w.start.toFixed(1)}s] ${w.text}`)
+      .join(' ');
+
+    const visualContext = visualScenes.length > 0
+      ? `\n\nVisual scene cuts detected at: ${visualScenes.map(t => t.toFixed(1) + 's').join(', ')}`
+      : '';
+
+    const prompt = `Analyze this video transcript and identify distinct SCENES based on topic changes, subject matter shifts, or natural transitions.
+
+Transcript with timestamps:
+${formattedTranscript}
+${visualContext}
+
+For each scene:
+1. Provide a SHORT, DESCRIPTIVE title (2-6 words)
+2. Identify the START and END timestamps
+3. Rate your confidence (0.0-1.0) in the scene break
+
+Guidelines:
+- First scene starts at 0
+- Scenes should be at least 10 seconds long
+- Look for topic changes, speaker changes, new subjects
+- Consider visual scene cuts if provided
+- Aim for 3-12 scenes depending on content length
+- The last scene should end at the video's duration (${videoAsset.duration.toFixed(1)}s)
+
+Return ONLY valid JSON:
+{
+  "scenes": [
+    {"title": "Introduction", "start": 0, "end": 45.5, "confidence": 0.95},
+    {"title": "Main Discussion", "start": 45.5, "end": 120.0, "confidence": 0.8}
+  ]
+}`;
+
+    console.log(`[${jobId}] Sending to Gemini for scene analysis...`);
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: 'application/json' }
+    });
+
+    let responseText = response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    let result;
+    try {
+      result = JSON.parse(responseText);
+    } catch {
+      const match = responseText.match(/\{[\s\S]*\}/);
+      result = match ? JSON.parse(match[0]) : { scenes: [] };
+    }
+
+    if (!result.scenes || result.scenes.length === 0) {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ success: true, scenes: [], totalDuration: videoAsset.duration, analyzedAssetId: videoAsset.id }));
+      return;
+    }
+
+    // Step 4: Generate thumbnails for each scene
+    console.log(`[${jobId}] Generating thumbnails for ${result.scenes.length} scenes...`);
+    const scenes = [];
+    for (let i = 0; i < result.scenes.length; i++) {
+      const scene = result.scenes[i];
+      const sceneId = `scene-${Date.now()}-${i}`;
+      const thumbTime = Math.min(scene.start + 1, scene.end - 0.5).toFixed(2); // 1 second into scene
+      const thumbPath = join(session.assetsDir, `${sceneId}_thumb.jpg`);
+
+      try {
+        await runFFmpeg([
+          '-y', '-ss', thumbTime, '-i', videoAsset.path,
+          '-frames:v', '1', '-vf', 'scale=320:-1', thumbPath
+        ], jobId, 10000); // 10s timeout for thumbnail
+      } catch (e) {
+        console.log(`[${jobId}] Thumbnail failed for scene ${i}: ${e.message}`);
+      }
+
+      // Check if this scene aligns with a visual break
+      const isVisualBreak = visualScenes.some(vt =>
+        Math.abs(vt - scene.start) < 2.0 || Math.abs(vt - scene.end) < 2.0
+      );
+
+      scenes.push({
+        id: sceneId,
+        title: scene.title || `Scene ${i + 1}`,
+        startTime: scene.start,
+        endTime: scene.end,
+        duration: scene.end - scene.start,
+        thumbnailUrl: existsSync(thumbPath)
+          ? `/session/${sessionId}/assets/${sceneId}_thumb.jpg`
+          : null,
+        confidence: scene.confidence || 0.5,
+        isVisualBreak,
+      });
+    }
+
+    console.log(`[${jobId}] Scene analysis complete: ${scenes.length} scenes`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      scenes,
+      totalDuration: videoAsset.duration,
+      analyzedAssetId: videoAsset.id,
+      visualScenesCount: visualScenes.length,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Scene analysis error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Export Scene (single scene as video) ──────────────────────────────────
+async function handleExportScene(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { assetId, startTime, endTime, title } = body;
+
+    if (startTime === undefined || endTime === undefined) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'startTime and endTime are required' }));
+      return;
+    }
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const asset of session.assets.values()) {
+        if (asset.type === 'video' && !asset.aiGenerated && existsSync(asset.path)) {
+          videoAsset = asset;
+          break;
+        }
+      }
+    }
+
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Asset not found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === EXPORT SCENE ===`);
+    console.log(`[${jobId}] Exporting: ${title || 'Untitled'} (${startTime}s - ${endTime}s)`);
+
+    const duration = endTime - startTime;
+    const safeTitle = (title || 'scene').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 50);
+    const outputFilename = `${safeTitle}_${Date.now()}.mp4`;
+    const outputPath = join(session.rendersDir, outputFilename);
+
+    // Ensure renders directory exists
+    if (!existsSync(session.rendersDir)) {
+      mkdirSync(session.rendersDir, { recursive: true });
+    }
+
+    await runFFmpeg([
+      '-y',
+      '-ss', startTime.toString(),
+      '-i', videoAsset.path,
+      '-t', duration.toString(),
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '18',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      outputPath
+    ], jobId);
+
+    console.log(`[${jobId}] Scene exported: ${outputFilename}`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      downloadUrl: `/session/${sessionId}/renders/${outputFilename}`,
+      filename: outputFilename,
+      duration,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Export scene error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── AI B-Roll Suggestions ──────────────────────────────────
+async function handleSuggestBroll(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { assetId, includePexels = true, includeUnsplash = true, includeAI = true } = body;
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) {
+        if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) {
+          videoAsset = a;
+          break;
+        }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === B-ROLL SUGGESTIONS ===`);
+
+    // Check if already running for this session
+    if (session._brollAnalysisRunning) {
+      console.log(`[${jobId}] B-roll analysis already in progress, skipping duplicate request`);
+      res.writeHead(409, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Analysis already in progress', inProgress: true }));
+      return;
+    }
+
+    // Get cached transcript or generate one
+    let transcriptData = session.transcriptCache?.get(videoAsset.id);
+    if (!transcriptData) {
+      session._brollAnalysisRunning = true;
+      console.log(`[${jobId}] Generating transcript for B-roll analysis...`);
+      // Call transcription (simplified - reuse existing logic)
+      const audioPath = join(session.assetsDir, `_broll_audio_${Date.now()}.mp3`);
+      await runFFmpeg(['-y', '-i', videoAsset.path, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', audioPath], jobId);
+
+      try {
+        transcriptData = await runLocalWhisper(audioPath, jobId);
+        // Save to cache for future requests
+        if (!session.transcriptCache) session.transcriptCache = new Map();
+        session.transcriptCache.set(videoAsset.id, {
+          ...transcriptData,
+          cachedAt: Date.now()
+        });
+        console.log(`[${jobId}] Transcript cached for future use`);
+      } catch (e) {
+        console.log(`[${jobId}] Whisper failed: ${e.message}`);
+        // Fallback to basic transcript
+        transcriptData = { text: '', words: [] };
+      }
+
+      try { unlinkSync(audioPath); } catch {}
+      session._brollAnalysisRunning = false;
+    } else {
+      console.log(`[${jobId}] Using cached transcript`);
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+      return;
+    }
+
+    // Analyze for B-roll opportunities
+    console.log(`[${jobId}] Analyzing transcript for B-roll opportunities...`);
+    const opportunities = await analyzeBrollOpportunities(
+      transcriptData.text || '',
+      transcriptData.words || [],
+      videoAsset.duration || 60,
+      geminiKey
+    );
+
+    console.log(`[${jobId}] Found ${opportunities.length} B-roll opportunities`);
+
+    // Fetch sources for each opportunity
+    const suggestions = [];
+    const pexelsKey = process.env.PEXELS_API_KEY;
+    const unsplashKey = process.env.UNSPLASH_ACCESS_KEY;
+
+    for (const opp of opportunities) {
+      const sources = [];
+
+      // Search Pexels
+      if (includePexels && pexelsKey) {
+        try {
+          const pexelsResponse = await fetch(
+            `https://api.pexels.com/v1/search?query=${encodeURIComponent(opp.keyword)}&per_page=3&orientation=square`,
+            { headers: { Authorization: pexelsKey } }
+          );
+          if (pexelsResponse.ok) {
+            const pexelsData = await pexelsResponse.json();
+            for (const photo of (pexelsData.photos || []).slice(0, 3)) {
+              sources.push({
+                type: 'pexels',
+                thumbnailUrl: photo.src.small,
+                fullUrl: photo.src.large,
+                attribution: `Photo by ${photo.photographer} on Pexels`,
+              });
+            }
+          }
+        } catch (e) {
+          console.log(`[${jobId}] Pexels search failed:`, e.message);
+        }
+      }
+
+      // Search Unsplash
+      if (includeUnsplash && unsplashKey) {
+        try {
+          const unsplashResponse = await fetch(
+            `https://api.unsplash.com/search/photos?query=${encodeURIComponent(opp.keyword)}&per_page=3`,
+            { headers: { Authorization: `Client-ID ${unsplashKey}` } }
+          );
+          if (unsplashResponse.ok) {
+            const unsplashData = await unsplashResponse.json();
+            for (const photo of (unsplashData.results || []).slice(0, 3)) {
+              sources.push({
+                type: 'unsplash',
+                thumbnailUrl: photo.urls.thumb,
+                fullUrl: photo.urls.regular,
+                attribution: `Photo by ${photo.user.name} on Unsplash`,
+              });
+            }
+          }
+        } catch (e) {
+          console.log(`[${jobId}] Unsplash search failed:`, e.message);
+        }
+      }
+
+      // Add AI generation option
+      if (includeAI) {
+        sources.push({
+          type: 'ai-generated',
+          thumbnailUrl: null, // Will be generated on apply
+          fullUrl: null,
+          prompt: opp.prompt,
+        });
+      }
+
+      suggestions.push({
+        id: `broll-${Date.now()}-${suggestions.length}`,
+        keyword: opp.keyword,
+        timestamp: opp.timestamp,
+        reason: opp.reason,
+        prompt: opp.prompt,
+        sources,
+      });
+    }
+
+    console.log(`[${jobId}] B-roll suggestions complete: ${suggestions.length} suggestions`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      suggestions,
+      analyzedAssetId: videoAsset.id,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] B-roll suggestion error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Apply a B-roll suggestion (download and register asset)
+async function handleApplyBrollSuggestion(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { suggestionId, sourceType, sourceUrl, prompt, timestamp, keyword } = body;
+
+    console.log(`\n[${jobId}] === APPLY B-ROLL ===`);
+    console.log(`[${jobId}] Type: ${sourceType}, Keyword: ${keyword}`);
+
+    const assetId = randomUUID();
+    const assetPath = join(session.assetsDir, `${assetId}.jpg`);
+
+    if (sourceType === 'ai-generated') {
+      // Generate image using Gemini
+      const geminiKey = process.env.GEMINI_API_KEY;
+      if (!geminiKey) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+        return;
+      }
+
+      const success = await generateImageWithGemini(prompt, geminiKey, assetPath);
+      if (!success) {
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: 'Failed to generate image' }));
+        return;
+      }
+    } else {
+      // Download from Pexels/Unsplash
+      if (!sourceUrl) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: 'sourceUrl required for stock images' }));
+        return;
+      }
+
+      console.log(`[${jobId}] Downloading from ${sourceType}...`);
+      const response = await fetch(sourceUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to download image: ${response.status}`);
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      writeFileSync(assetPath, buffer);
+      console.log(`[${jobId}] Downloaded: ${(buffer.length / 1024).toFixed(1)} KB`);
+    }
+
+    // Get image dimensions
+    const info = await getMediaInfo(assetPath);
+
+    // Generate thumbnail
+    const thumbPath = join(session.assetsDir, `${assetId}_thumb.jpg`);
+    await runFFmpeg([
+      '-y', '-i', assetPath,
+      '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2',
+      '-frames:v', '1', '-q:v', '3', thumbPath
+    ], jobId);
+
+    // Register as asset
+    const asset = {
+      id: assetId,
+      type: 'image',
+      filename: `broll_${keyword || 'image'}.jpg`,
+      duration: 3, // Default 3 seconds for B-roll
+      size: statSync(assetPath).size,
+      width: info.width || 512,
+      height: info.height || 512,
+      path: assetPath,
+      thumbnailUrl: `/session/${sessionId}/assets/${assetId}/thumbnail`,
+      streamUrl: `/session/${sessionId}/assets/${assetId}/stream`,
+      aiGenerated: sourceType === 'ai-generated',
+      brollKeyword: keyword,
+    };
+    session.assets.set(assetId, asset);
+    await saveAssetMetadata(session);
+
+    console.log(`[${jobId}] B-roll asset registered: ${assetId}`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      assetId,
+      timestamp,
+      duration: 3,
+      thumbnailUrl: asset.thumbnailUrl,
+      streamUrl: asset.streamUrl,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Apply B-roll error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── "Make it Viral" Features ──────────────────────────────────
+
+// Analyze transcript for emphasis points (stressed words, pauses, volume peaks)
+async function handleAnalyzeEmphasis(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { assetId } = body;
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) {
+        if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) {
+          videoAsset = a;
+          break;
+        }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === ANALYZE EMPHASIS ===`);
+
+    // Get transcript
+    let transcriptData = session.transcriptCache?.get(videoAsset.id);
+    if (!transcriptData || !transcriptData.words?.length) {
+      console.log(`[${jobId}] Generating transcript for emphasis analysis...`);
+      const audioPath = join(session.assetsDir, `_emphasis_audio_${Date.now()}.mp3`);
+      await runFFmpeg(['-y', '-i', videoAsset.path, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', audioPath], jobId);
+
+      try {
+        transcriptData = await runLocalWhisper(audioPath, jobId);
+        if (!session.transcriptCache) session.transcriptCache = new Map();
+        session.transcriptCache.set(videoAsset.id, transcriptData);
+      } catch {
+        transcriptData = { text: '', words: [] };
+      }
+
+      try { unlinkSync(audioPath); } catch {}
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+      return;
+    }
+
+    // Use Gemini to analyze emphasis points
+    console.log(`[${jobId}] Analyzing emphasis points with AI...`);
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `Analyze this transcript and identify 5-10 key emphasis points where a zoom cut would be impactful for a "viral" video edit. Look for:
+- Stressed or emphasized words
+- Punchlines or key statements
+- Emotional peaks
+- Important revelations
+- Words before natural pauses
+- Action words or exclamations
+
+Transcript: "${transcriptData.text || ''}"
+
+Word timings: ${JSON.stringify(transcriptData.words?.slice(0, 100) || [])}${(transcriptData.words?.length || 0) > 100 ? '...' : ''}
+
+Return a JSON array with this structure:
+[
+  {
+    "timestamp": 15.2,
+    "word": "amazing",
+    "confidence": 0.9,
+    "type": "emphasis",
+    "reason": "key revelation"
+  }
+]
+
+Types: "emphasis", "punchline", "emotional", "pause", "exclamation"
+Confidence: 0-1 scale
+
+IMPORTANT: Return ONLY valid JSON array, no markdown.`
+        }]
+      }],
+      config: { responseMimeType: 'application/json' }
+    });
+
+    let emphasisPoints = [];
+    try {
+      const parsed = JSON.parse(response.text || '[]');
+      emphasisPoints = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      const match = (response.text || '').match(/\[[\s\S]*\]/);
+      if (match) {
+        try { emphasisPoints = JSON.parse(match[0]); } catch {}
+      }
+    }
+
+    console.log(`[${jobId}] Found ${emphasisPoints.length} emphasis points`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      emphasisPoints,
+      totalDuration: videoAsset.duration,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Analyze emphasis error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Detect slow/boring sections that could be cut
+async function handleDetectSlowSections(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const { assetId } = body;
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) {
+        if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) {
+          videoAsset = a;
+          break;
+        }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === DETECT SLOW SECTIONS ===`);
+
+    // Get transcript
+    let transcriptData = session.transcriptCache?.get(videoAsset.id);
+    if (!transcriptData) {
+      transcriptData = { text: '', words: [] };
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+      return;
+    }
+
+    // Use Gemini to find slow sections
+    console.log(`[${jobId}] Analyzing for slow sections...`);
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `Analyze this transcript and identify sections that might be slow, repetitive, or less engaging. These are candidates for cutting to make the video more "viral" and fast-paced. Look for:
+- Repetitive explanations
+- Long pauses or filler words
+- Off-topic tangents
+- Low-energy sections
+
+Transcript: "${transcriptData.text || ''}"
+
+Word timings: ${JSON.stringify(transcriptData.words?.slice(0, 100) || [])}
+
+Video duration: ${videoAsset.duration}s
+
+Return a JSON array with this structure:
+[
+  {
+    "startTime": 30.5,
+    "endTime": 45.2,
+    "reason": "repetitive explanation",
+    "suggestion": "Cut or speed up",
+    "confidence": 0.7
+  }
+]
+
+IMPORTANT: Return ONLY valid JSON array, no markdown.`
+        }]
+      }],
+      config: { responseMimeType: 'application/json' }
+    });
+
+    let slowSections = [];
+    try {
+      const parsed = JSON.parse(response.text || '[]');
+      slowSections = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      const match = (response.text || '').match(/\[[\s\S]*\]/);
+      if (match) {
+        try { slowSections = JSON.parse(match[0]); } catch {}
+      }
+    }
+
+    console.log(`[${jobId}] Found ${slowSections.length} slow sections`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      slowSections,
+      totalDuration: videoAsset.duration,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Detect slow sections error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Content Repurposing (Long to Shorts) ──────────────────────────
+
+// Analyze video for potential shorts with virality scoring
+async function handleAnalyzeForShorts(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const {
+      targetPlatform = 'tiktok',
+      maxDuration = 60,
+      minDuration = 15,
+      targetCount = 5,
+      assetId,
+    } = body;
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) {
+        if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) {
+          videoAsset = a;
+          break;
+        }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === ANALYZE FOR SHORTS ===`);
+    console.log(`[${jobId}] Platform: ${targetPlatform}, Duration: ${minDuration}-${maxDuration}s, Target: ${targetCount}`);
+
+    // Get transcript
+    let transcriptData = session.transcriptCache?.get(videoAsset.id);
+    if (!transcriptData || !transcriptData.words?.length) {
+      console.log(`[${jobId}] Generating transcript...`);
+      const audioPath = join(session.assetsDir, `_shorts_audio_${Date.now()}.mp3`);
+      await runFFmpeg(['-y', '-i', videoAsset.path, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', audioPath], jobId);
+
+      try {
+        transcriptData = await runLocalWhisper(audioPath, jobId);
+        if (!session.transcriptCache) session.transcriptCache = new Map();
+        session.transcriptCache.set(videoAsset.id, transcriptData);
+      } catch {
+        transcriptData = { text: '', words: [] };
+      }
+
+      try { unlinkSync(audioPath); } catch {}
+    }
+
+    const geminiKey = process.env.GEMINI_API_KEY;
+    if (!geminiKey) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+      return;
+    }
+
+    // Use Gemini to identify best segments for shorts
+    console.log(`[${jobId}] Analyzing for viral short candidates...`);
+    const ai = new GoogleGenAI({ apiKey: geminiKey });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `Analyze this video transcript and identify the ${targetCount} best segments that would make engaging short-form videos for ${targetPlatform}.
+
+Requirements:
+- Each segment should be between ${minDuration} and ${maxDuration} seconds
+- Segments should be self-contained with a clear hook and payoff
+- Prioritize: surprising moments, emotional peaks, actionable tips, funny moments, controversial takes
+
+Transcript: "${transcriptData.text || ''}"
+
+Word timings: ${JSON.stringify(transcriptData.words?.slice(0, 150) || [])}${(transcriptData.words?.length || 0) > 150 ? '...' : ''}
+
+Video duration: ${videoAsset.duration}s
+
+Return a JSON array with this structure:
+[
+  {
+    "startTime": 30.5,
+    "endTime": 55.2,
+    "viralityScore": 85,
+    "viralityFactors": ["strong hook", "emotional content", "actionable"],
+    "suggestedHook": "You won't believe what happens when...",
+    "suggestedTitle": "This changed everything",
+    "suggestedDescription": "Short description for the platform..."
+  }
+]
+
+Score 0-100 based on viral potential. Higher = more likely to perform well.
+
+IMPORTANT: Return ONLY valid JSON array, no markdown.`
+        }]
+      }],
+      config: { responseMimeType: 'application/json' }
+    });
+
+    let candidates = [];
+    try {
+      const parsed = JSON.parse(response.text || '[]');
+      candidates = Array.isArray(parsed) ? parsed : [];
+    } catch {
+      const match = (response.text || '').match(/\[[\s\S]*\]/);
+      if (match) {
+        try { candidates = JSON.parse(match[0]); } catch {}
+      }
+    }
+
+    // Generate thumbnails for each candidate
+    console.log(`[${jobId}] Generating thumbnails for ${candidates.length} candidates...`);
+    const shortsWithThumbs = [];
+
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      const thumbId = `short_${i}_${Date.now()}`;
+      const thumbPath = join(session.assetsDir, `${thumbId}_thumb.jpg`);
+
+      // Extract frame from middle of segment
+      const midTime = ((c.startTime || 0) + (c.endTime || 30)) / 2;
+      try {
+        await runFFmpeg([
+          '-y', '-ss', midTime.toFixed(2), '-i', videoAsset.path,
+          '-vf', 'scale=270:480:force_original_aspect_ratio=decrease,pad=270:480:(ow-iw)/2:(oh-ih)/2',
+          '-frames:v', '1', '-q:v', '3', thumbPath
+        ], jobId);
+      } catch {}
+
+      shortsWithThumbs.push({
+        id: `short-${Date.now()}-${i}`,
+        startTime: c.startTime || 0,
+        endTime: c.endTime || 30,
+        duration: (c.endTime || 30) - (c.startTime || 0),
+        viralityScore: c.viralityScore || 50,
+        viralityFactors: c.viralityFactors || [],
+        suggestedHook: c.suggestedHook || '',
+        suggestedTitle: c.suggestedTitle || `Short ${i + 1}`,
+        suggestedDescription: c.suggestedDescription || '',
+        thumbnailUrl: existsSync(thumbPath)
+          ? `/session/${sessionId}/assets/${thumbId}_thumb.jpg`
+          : null,
+        selected: true,
+      });
+    }
+
+    // Sort by virality score
+    shortsWithThumbs.sort((a, b) => b.viralityScore - a.viralityScore);
+
+    console.log(`[${jobId}] Found ${shortsWithThumbs.length} short candidates`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      candidates: shortsWithThumbs,
+      targetPlatform,
+      analyzedAssetId: videoAsset.id,
+      totalDuration: videoAsset.duration,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Analyze for shorts error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// Export a single short with optional 9:16 crop
+async function handleExportShort(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const {
+      startTime,
+      endTime,
+      title,
+      assetId,
+      cropTo916 = true,
+      addHook,
+      hookText,
+    } = body;
+
+    if (startTime === undefined || endTime === undefined) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'startTime and endTime required' }));
+      return;
+    }
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) {
+        if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) {
+          videoAsset = a;
+          break;
+        }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === EXPORT SHORT ===`);
+    console.log(`[${jobId}] ${startTime}s - ${endTime}s, 9:16: ${cropTo916}`);
+
+    const duration = endTime - startTime;
+    const safeTitle = (title || 'short').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 30);
+    const outputFilename = `${safeTitle}_${Date.now()}.mp4`;
+    const outputPath = join(session.rendersDir, outputFilename);
+
+    if (!existsSync(session.rendersDir)) {
+      mkdirSync(session.rendersDir, { recursive: true });
+    }
+
+    // Build FFmpeg command
+    const ffmpegArgs = ['-y', '-ss', startTime.toString(), '-i', videoAsset.path, '-t', duration.toString()];
+
+    if (cropTo916) {
+      // Crop to 9:16 (center crop)
+      ffmpegArgs.push('-vf', 'crop=ih*9/16:ih,scale=1080:1920');
+    }
+
+    ffmpegArgs.push(
+      '-c:v', 'libx264',
+      '-preset', 'fast',
+      '-crf', '18',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      outputPath
+    );
+
+    await runFFmpeg(ffmpegArgs, jobId);
+
+    console.log(`[${jobId}] Short exported: ${outputFilename}`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      downloadUrl: `/session/${sessionId}/renders/${outputFilename}`,
+      filename: outputFilename,
+      duration,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] Export short error:`, error.message);
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ error: error.message }));
   }
@@ -4259,6 +5557,386 @@ async function handleGenerateThumbnail(req, res, sessionId) {
   } catch (error) {
     console.error(`[${jobId}] Thumbnail error:`, error.message);
     res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
+// ─── Feature 8b: YouTube Thumbnail Generator ──────────────────
+async function handleGenerateYoutubeThumbnail(req, res, sessionId) {
+  const session = getSession(sessionId);
+  if (!session) {
+    res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: 'Session not found' }));
+    return;
+  }
+
+  const jobId = sessionId.substring(0, 8);
+
+  try {
+    const body = await parseBody(req);
+    const {
+      mode = 'best-frame', // 'best-frame' | 'specific-time' | 'variants'
+      timestamp,
+      style = 'youtube', // 'youtube' | 'dramatic' | 'minimal'
+      textOverlay,
+      variantCount = 3,
+      assetId,
+    } = body;
+
+    // Find video asset
+    let videoAsset = assetId ? session.assets.get(assetId) : null;
+    if (!videoAsset) {
+      for (const a of session.assets.values()) {
+        if (a.type === 'video' && !a.aiGenerated && existsSync(a.path)) {
+          videoAsset = a;
+          break;
+        }
+      }
+    }
+    if (!videoAsset) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No video asset found' }));
+      return;
+    }
+
+    console.log(`\n[${jobId}] === YOUTUBE THUMBNAIL GENERATOR ===`);
+    console.log(`[${jobId}] Mode: ${mode}, Style: ${style}, Variants: ${variantCount}`);
+
+    // AI-GENERATED MODE: Create eye-catching thumbnail from video theme
+    if (mode === 'ai-generated') {
+      const geminiKey = process.env.GEMINI_API_KEY;
+      if (!geminiKey) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: 'GEMINI_API_KEY not configured' }));
+        return;
+      }
+
+      // Get transcript for context
+      let transcriptData = session.transcriptCache?.get(videoAsset.id);
+      if (!transcriptData) {
+        console.log(`[${jobId}] Generating transcript for thumbnail analysis...`);
+        const audioPath = join(session.assetsDir, `_thumb_audio_${Date.now()}.mp3`);
+        await runFFmpeg(['-y', '-i', videoAsset.path, '-vn', '-ac', '1', '-ar', '16000', '-b:a', '64k', '-t', '300', audioPath], jobId);
+        try {
+          transcriptData = await runLocalWhisper(audioPath, jobId);
+          if (!session.transcriptCache) session.transcriptCache = new Map();
+          session.transcriptCache.set(videoAsset.id, { ...transcriptData, cachedAt: Date.now() });
+        } catch {
+          transcriptData = { text: '', words: [] };
+        }
+        try { unlinkSync(audioPath); } catch {}
+      }
+
+      // Use Gemini to create a creative thumbnail prompt
+      console.log(`[${jobId}] Generating creative thumbnail prompt...`);
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      const promptResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{
+          role: 'user',
+          parts: [{
+            text: `You are a YouTube thumbnail designer. Based on this video transcript, create a compelling thumbnail prompt for AI image generation.
+
+Transcript: "${(transcriptData.text || '').substring(0, 2000)}"
+
+Create a SINGLE detailed prompt for an eye-catching YouTube thumbnail. Consider:
+- The main topic/theme of the video
+- What would make someone click on this video
+- Bold, vibrant imagery that stands out
+- Expressions, emotions, or dramatic scenes
+- NO text in the image (text overlays are added separately)
+
+Guidelines for the prompt:
+- Be SPECIFIC and DETAILED (40-60 words)
+- Request photorealistic or high-quality 3D render style
+- Include dramatic lighting (studio lighting, rim light, neon glow)
+- Specify bold colors and high contrast
+- Describe composition (close-up face, centered subject, dynamic angle)
+- Include quality modifiers (8K, cinematic, professional, trending on artstation)
+- Example styles: "dramatic portrait", "product hero shot", "concept art", "cinematic still"
+
+Return ONLY the prompt text, no explanation or formatting.`
+          }]
+        }]
+      });
+
+      const thumbnailPrompt = promptResponse.text?.trim() || 'Professional YouTube thumbnail, dramatic lighting, bold colors, 8K quality';
+      console.log(`[${jobId}] Generated prompt: ${thumbnailPrompt.substring(0, 100)}...`);
+
+      // Generate multiple variants with fal.ai
+      const variants = [];
+      const variantsToGenerate = Math.min(variantCount, 4);
+
+      for (let i = 0; i < variantsToGenerate; i++) {
+        try {
+          console.log(`[${jobId}] Generating AI thumbnail ${i + 1}/${variantsToGenerate}...`);
+
+          const result = await fal.subscribe('fal-ai/flux/dev', {
+            input: {
+              prompt: `${thumbnailPrompt}. YouTube thumbnail style, 16:9 aspect ratio, no text.`,
+              image_size: { width: 1920, height: 1080 },
+              num_images: 1,
+              guidance_scale: 3.5,
+              num_inference_steps: 28,
+            },
+            logs: false,
+          });
+
+          const images = result?.images || result?.data?.images || [];
+          if (images.length > 0) {
+            const imageUrl = images[0].url || images[0];
+            const response = await fetch(imageUrl);
+            if (response.ok) {
+              const variantId = randomUUID();
+              const variant1080Path = join(session.assetsDir, `${variantId}_1080.jpg`);
+              const variant720Path = join(session.assetsDir, `${variantId}_720.jpg`);
+
+              const buffer = Buffer.from(await response.arrayBuffer());
+              writeFileSync(variant1080Path, buffer);
+
+              // Create 720p version
+              await runFFmpeg(['-y', '-i', variant1080Path, '-vf', 'scale=1280:720', '-q:v', '2', variant720Path], jobId);
+
+              // Create thumbnail
+              await runFFmpeg(['-y', '-i', variant1080Path, '-vf', 'scale=160:90', '-q:v', '3', join(session.assetsDir, `${variantId}_thumb.jpg`)], jobId);
+
+              // Register asset
+              session.assets.set(variantId, {
+                id: variantId,
+                type: 'image',
+                filename: `ai_thumb_${i + 1}_1080p.jpg`,
+                duration: 0,
+                size: buffer.length,
+                width: 1920,
+                height: 1080,
+                path: variant1080Path,
+                thumbnailUrl: `/session/${sessionId}/assets/${variantId}/thumbnail`,
+                streamUrl: `/session/${sessionId}/assets/${variantId}/stream`,
+                aiGenerated: true,
+              });
+
+              // Save 720p to renders
+              if (!existsSync(session.rendersDir)) mkdirSync(session.rendersDir, { recursive: true });
+              writeFileSync(join(session.rendersDir, `${variantId}_720.jpg`), readFileSync(variant720Path));
+
+              variants.push({
+                assetId: variantId,
+                thumbnailUrl: `/session/${sessionId}/assets/${variantId}/thumbnail`,
+                downloadUrl1080: `/session/${sessionId}/assets/${variantId}/stream`,
+                downloadUrl720: `/session/${sessionId}/renders/${variantId}_720.jpg`,
+                label: `AI Variant ${i + 1}`,
+                timestamp: 0,
+                style: 'ai-generated',
+                score: 100 - i,
+                prompt: thumbnailPrompt,
+              });
+
+              console.log(`[${jobId}] AI thumbnail ${i + 1} generated successfully`);
+            }
+          }
+        } catch (e) {
+          console.log(`[${jobId}] Failed to generate AI thumbnail ${i + 1}:`, e.message);
+        }
+      }
+
+      if (variants.length === 0) {
+        res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: 'Failed to generate any AI thumbnails' }));
+        return;
+      }
+
+      await saveAssetMetadata(session);
+
+      console.log(`[${jobId}] Generated ${variants.length} AI thumbnail variants`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({
+        success: true,
+        variants,
+        recommendedIndex: 0,
+        explanation: 'AI-generated thumbnails based on video content.',
+        prompt: thumbnailPrompt, // Include prompt for copy/paste
+      }));
+      return;
+    }
+
+    const info = await getMediaInfo(videoAsset.path);
+    const duration = info.duration || 10;
+
+    // Determine timestamps to extract
+    let extractTimes = [];
+    if (mode === 'specific-time' && timestamp != null) {
+      extractTimes = [timestamp];
+    } else if (mode === 'variants') {
+      // Extract at multiple points for variety
+      extractTimes = [];
+      for (let i = 0; i < variantCount; i++) {
+        extractTimes.push(duration * (0.1 + (0.8 * i / (variantCount - 1 || 1))));
+      }
+    } else {
+      // best-frame mode: extract candidates and score
+      extractTimes = [0.1, 0.25, 0.4, 0.5, 0.6, 0.75, 0.9].map(t => duration * t);
+    }
+
+    // Style filters
+    const styleFilters = {
+      youtube: 'eq=saturation=1.2:brightness=0.05,unsharp=5:5:0.8',
+      dramatic: 'eq=contrast=1.3:saturation=1.1,colorbalance=rs=0.1:gs=-0.05:bs=-0.1',
+      minimal: 'eq=brightness=0.02',
+    };
+
+    const styleFilter = styleFilters[style] || styleFilters.youtube;
+
+    // Extract and process frames
+    const candidates = [];
+    for (let i = 0; i < extractTimes.length; i++) {
+      const t = extractTimes[i].toFixed(2);
+      const tempPath = join(session.assetsDir, `_yt_thumb_${i}.jpg`);
+
+      try {
+        // Extract frame with style enhancement
+        let vf = `scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,${styleFilter}`;
+
+        await runFFmpeg([
+          '-y', '-ss', t, '-i', videoAsset.path,
+          '-frames:v', '1',
+          '-vf', vf,
+          '-q:v', '2',
+          tempPath
+        ], jobId);
+
+        // Score using edge detection (sharpness)
+        let score = 0;
+        try {
+          const edgeResult = await runFFmpeg([
+            '-i', tempPath,
+            '-vf', 'sobel,metadata=mode=print:file=-',
+            '-frames:v', '1', '-f', 'null', '-'
+          ], jobId).catch(() => '');
+          score = edgeResult.length; // More edges = sharper = better
+        } catch {}
+
+        candidates.push({
+          timestamp: parseFloat(t),
+          tempPath,
+          score,
+        });
+      } catch (e) {
+        console.log(`[${jobId}] Failed to extract at ${t}s:`, e.message);
+      }
+    }
+
+    if (candidates.length === 0) {
+      res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'Failed to extract any frames' }));
+      return;
+    }
+
+    // Sort by score and take top variants
+    candidates.sort((a, b) => b.score - a.score);
+    const topCandidates = mode === 'best-frame'
+      ? [candidates[0]]
+      : candidates.slice(0, variantCount);
+
+    // Process each variant (add text overlay if specified)
+    const variants = [];
+    for (let i = 0; i < topCandidates.length; i++) {
+      const c = topCandidates[i];
+      const variantId = randomUUID();
+      const variant1080Path = join(session.assetsDir, `${variantId}_1080.jpg`);
+      const variant720Path = join(session.assetsDir, `${variantId}_720.jpg`);
+
+      // Copy/process to final paths
+      if (textOverlay && textOverlay.text) {
+        // Add text overlay using drawtext
+        const { text, position = 'bottom', fontSize = 'large', color = '#ffffff' } = textOverlay;
+        const fontSizes = { small: 48, medium: 72, large: 96 };
+        const fSize = fontSizes[fontSize] || 72;
+        const yPos = position === 'top' ? '50' : position === 'center' ? '(h-text_h)/2' : 'h-text_h-80';
+
+        // Escape text for FFmpeg
+        const escapedText = text.replace(/'/g, "'\\''").replace(/:/g, '\\:');
+
+        await runFFmpeg([
+          '-y', '-i', c.tempPath,
+          '-vf', `drawtext=text='${escapedText}':fontsize=${fSize}:fontcolor=${color}:x=(w-text_w)/2:y=${yPos}:borderw=4:bordercolor=black`,
+          '-q:v', '2',
+          variant1080Path
+        ], jobId);
+      } else {
+        // Just copy
+        const data = readFileSync(c.tempPath);
+        writeFileSync(variant1080Path, data);
+      }
+
+      // Create 720p version
+      await runFFmpeg([
+        '-y', '-i', variant1080Path,
+        '-vf', 'scale=1280:720',
+        '-q:v', '2',
+        variant720Path
+      ], jobId);
+
+      // Register as assets
+      const asset1080 = {
+        id: variantId,
+        type: 'image',
+        filename: `youtube_thumb_${i + 1}_1080p.jpg`,
+        duration: 0,
+        size: statSync(variant1080Path).size,
+        width: 1920,
+        height: 1080,
+        path: variant1080Path,
+        thumbnailUrl: `/session/${sessionId}/assets/${variantId}/thumbnail`,
+        streamUrl: `/session/${sessionId}/assets/${variantId}/stream`,
+        aiGenerated: false,
+      };
+      session.assets.set(variantId, asset1080);
+
+      // Copy as thumbnail
+      try {
+        await runFFmpeg(['-y', '-i', variant1080Path, '-vf', 'scale=160:90', '-q:v', '3', join(session.assetsDir, `${variantId}_thumb.jpg`)], jobId);
+      } catch {}
+
+      variants.push({
+        assetId: variantId,
+        thumbnailUrl: `/session/${sessionId}/assets/${variantId}/thumbnail`,
+        downloadUrl1080: `/session/${sessionId}/assets/${variantId}/stream`,
+        downloadUrl720: `/session/${sessionId}/renders/${variantId}_720.jpg`,
+        label: `Variant ${i + 1}`,
+        timestamp: c.timestamp,
+        style,
+        score: c.score,
+      });
+
+      // Also save 720p to renders for download
+      const renders720Path = join(session.rendersDir, `${variantId}_720.jpg`);
+      if (!existsSync(session.rendersDir)) mkdirSync(session.rendersDir, { recursive: true });
+      const data720 = readFileSync(variant720Path);
+      writeFileSync(renders720Path, data720);
+    }
+
+    // Clean up temp files
+    for (const c of candidates) {
+      try { unlinkSync(c.tempPath); } catch {}
+    }
+
+    // Find recommended variant (highest score)
+    const recommendedIndex = 0; // Already sorted by score
+
+    console.log(`[${jobId}] Generated ${variants.length} thumbnail variants`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      success: true,
+      variants,
+      recommendedIndex,
+      explanation: `Selected frames with highest visual quality. Style: ${style}.`,
+    }));
+
+  } catch (error) {
+    console.error(`[${jobId}] YouTube thumbnail error:`, error.message);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
   }
 }
 
@@ -8964,6 +10642,27 @@ const server = http.createServer(async (req, res) => {
         await handleAssetThumbnail(req, res, sessionId, assetId);
       } else if (req.method === 'GET' && subAction === 'stream') {
         await handleAssetStream(req, res, sessionId, assetId);
+      } else if (req.method === 'GET' && !subAction && (assetId.endsWith('.jpg') || assetId.endsWith('.png'))) {
+        // Serve static image files from assets directory (e.g., scene thumbnails)
+        const session = getSession(sessionId);
+        if (!session) {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: 'Session not found' }));
+          return;
+        }
+        const filePath = join(session.assetsDir, assetId);
+        if (existsSync(filePath)) {
+          const ext = assetId.endsWith('.png') ? 'png' : 'jpeg';
+          res.writeHead(200, {
+            'Content-Type': `image/${ext}`,
+            'Access-Control-Allow-Origin': '*',
+            'Cache-Control': 'public, max-age=3600',
+          });
+          createReadStream(filePath).pipe(res);
+        } else {
+          res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+          res.end(JSON.stringify({ error: 'File not found' }));
+        }
       } else {
         res.writeHead(404, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Asset endpoint not found' }));
@@ -9043,6 +10742,38 @@ const server = http.createServer(async (req, res) => {
     else if (req.method === 'POST' && action === 'scene-detect') {
       await handleSceneDetect(req, res, sessionId);
     }
+    // Smart scene analysis - transcript + visual analysis for topic-based scenes
+    else if (req.method === 'POST' && action === 'analyze-scenes') {
+      await handleAnalyzeScenes(req, res, sessionId);
+    }
+    // Export a single scene as separate video file
+    else if (req.method === 'POST' && action === 'export-scene') {
+      await handleExportScene(req, res, sessionId);
+    }
+    // B-Roll suggestions - analyze transcript for visual overlay opportunities
+    else if (req.method === 'POST' && action === 'suggest-broll') {
+      await handleSuggestBroll(req, res, sessionId);
+    }
+    // Apply B-roll suggestion - download/generate and register asset
+    else if (req.method === 'POST' && action === 'apply-broll') {
+      await handleApplyBrollSuggestion(req, res, sessionId);
+    }
+    // Analyze emphasis points for viral zoom cuts
+    else if (req.method === 'POST' && action === 'analyze-emphasis') {
+      await handleAnalyzeEmphasis(req, res, sessionId);
+    }
+    // Detect slow sections for cutting
+    else if (req.method === 'POST' && action === 'detect-slow-sections') {
+      await handleDetectSlowSections(req, res, sessionId);
+    }
+    // Analyze video for short candidates with virality scoring
+    else if (req.method === 'POST' && action === 'analyze-for-shorts') {
+      await handleAnalyzeForShorts(req, res, sessionId);
+    }
+    // Export a single short with 9:16 crop
+    else if (req.method === 'POST' && action === 'export-short') {
+      await handleExportShort(req, res, sessionId);
+    }
     // Mute specific time segments (for filler word audio removal)
     else if (req.method === 'POST' && action === 'mute-segments') {
       await handleMuteSegments(req, res, sessionId);
@@ -9074,6 +10805,10 @@ const server = http.createServer(async (req, res) => {
     // Thumbnail Generator: extract frame as image asset
     else if (req.method === 'POST' && action === 'generate-thumbnail') {
       await handleGenerateThumbnail(req, res, sessionId);
+    }
+    // YouTube Thumbnail Generator: AI-powered thumbnail with variants
+    else if (req.method === 'POST' && action === 'generate-youtube-thumbnail') {
+      await handleGenerateYoutubeThumbnail(req, res, sessionId);
     }
     // Waveform Data: extract RMS amplitude array for UI display
     else if (req.method === 'POST' && action === 'waveform-data') {

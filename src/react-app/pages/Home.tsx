@@ -13,13 +13,24 @@ import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPane
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, HelpCircle } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, HelpCircle, Layers } from 'lucide-react';
 import KeyboardShortcuts from '@/react-app/components/KeyboardShortcuts';
 import ProjectTemplates from '@/react-app/components/ProjectTemplates';
 import FrameTemplatePanel from '@/react-app/components/FrameTemplatePanel';
 import FrameTemplateSelector from '@/react-app/components/FrameTemplateSelector';
 import { useFrameTemplates, createBlankTemplate } from '@/react-app/hooks/useFrameTemplates';
 import { useOverlayAssets } from '@/react-app/hooks/useOverlayAssets';
+import { useSceneDetection } from '@/react-app/hooks/useSceneDetection';
+import SceneDetectionPanel from '@/react-app/components/SceneDetectionPanel';
+import { useThumbnailGenerator } from '@/react-app/hooks/useThumbnailGenerator';
+import ThumbnailGeneratorPanel from '@/react-app/components/ThumbnailGeneratorPanel';
+import { useBrollSuggestions } from '@/react-app/hooks/useBrollSuggestions';
+import BrollSuggestionsPanel from '@/react-app/components/BrollSuggestionsPanel';
+import { useViralEdit } from '@/react-app/hooks/useViralEdit';
+import ViralEditPanel from '@/react-app/components/ViralEditPanel';
+import { useContentRepurpose } from '@/react-app/hooks/useContentRepurpose';
+import ContentRepurposePanel from '@/react-app/components/ContentRepurposePanel';
+import { Image, Camera, Zap, Scissors } from 'lucide-react';
 import type { FrameTemplate } from '@/react-app/hooks/useProject';
 import type { TemplateId } from '@/remotion/templates';
 
@@ -44,6 +55,11 @@ export default function Home() {
   const [activeAgent, setActiveAgent] = useState<'director' | 'picasso' | 'dicaprio'>('director');
   const [showGifSearch, setShowGifSearch] = useState(false);
   const [showKeyboardShortcuts, setShowKeyboardShortcuts] = useState(false);
+  const [showScenePanel, setShowScenePanel] = useState(false);
+  const [showThumbnailPanel, setShowThumbnailPanel] = useState(false);
+  const [showBrollPanel, setShowBrollPanel] = useState(false);
+  const [showViralPanel, setShowViralPanel] = useState(false);
+  const [showRepurposePanel, setShowRepurposePanel] = useState(false);
 
   // Frame template for 9:16 vertical video styling
   const { templates: frameTemplates, saveTemplate: saveFrameTemplate, deleteTemplate: deleteFrameTemplate } = useFrameTemplates();
@@ -93,6 +109,7 @@ export default function Home() {
     updateTabClips,
     updateTabAsset,
     // Settings
+    settings,
     setSettings,
     setClips,
   } = useProject();
@@ -104,6 +121,34 @@ export default function Home() {
     uploadOverlayAsset,
     deleteOverlayAsset,
   } = useOverlayAssets(session?.sessionId);
+
+  // Smart Scene Detection
+  const {
+    scenes,
+    loading: scenesLoading,
+    error: scenesError,
+    analyzedAssetId,
+    detectScenes,
+    toggleSceneSelection,
+    selectAll: selectAllScenes,
+    updateSceneBoundary,
+    mergeScenes,
+    splitScene: splitDetectedScene,
+    clearScenes,
+    selectedScenes,
+  } = useSceneDetection(session?.sessionId);
+
+  // AI Thumbnail Generator
+  const thumbnailGenerator = useThumbnailGenerator(session?.sessionId);
+
+  // B-Roll Suggestions
+  const brollSuggestions = useBrollSuggestions(session?.sessionId);
+
+  // Viral Edit
+  const viralEdit = useViralEdit(session?.sessionId);
+
+  // Content Repurposing (Long to Shorts)
+  const contentRepurpose = useContentRepurpose(session?.sessionId);
 
   // Global undo stack (snapshot of clips array before destructive operations)
   const undoStackRef = useRef<import('@/react-app/hooks/useProject').TimelineClip[][]>([]);
@@ -508,6 +553,75 @@ export default function Home() {
     saveProject();
   }, [clips, currentTime, splitClip, saveProject]);
 
+  // Split timeline at all detected scene boundaries
+  const handleSplitAllScenes = useCallback(async () => {
+    if (!session || selectedScenes.length === 0) return;
+
+    // Find the V1 clip(s)
+    const v1Clips = clips.filter(c => c.trackId === 'V1');
+    if (v1Clips.length === 0) return;
+
+    // Save undo state
+    undoStackRef.current.push([...clips]);
+
+    // Sort scenes by start time
+    const sortedScenes = [...selectedScenes].sort((a, b) => a.startTime - b.startTime);
+
+    // Split at each scene boundary (except the last scene's end)
+    for (let i = 0; i < sortedScenes.length - 1; i++) {
+      const sceneEndTime = sortedScenes[i].endTime;
+
+      // Find the clip that contains this scene end
+      const clipToSplit = clips.find(c =>
+        c.trackId === 'V1' &&
+        sceneEndTime > c.start &&
+        sceneEndTime < c.start + c.duration
+      );
+
+      if (clipToSplit) {
+        splitClip(clipToSplit.id, sceneEndTime);
+      }
+    }
+
+    await saveProject();
+  }, [session, selectedScenes, clips, splitClip, saveProject]);
+
+  // Export selected scenes as individual video files
+  const handleExportSelectedScenes = useCallback(async () => {
+    if (!session || selectedScenes.length === 0 || !analyzedAssetId) return;
+
+    for (const scene of selectedScenes) {
+      try {
+        const response = await fetch(
+          `http://localhost:3333/session/${session.sessionId}/export-scene`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              assetId: analyzedAssetId,
+              startTime: scene.startTime,
+              endTime: scene.endTime,
+              title: scene.title,
+            }),
+          }
+        );
+
+        if (response.ok) {
+          const result = await response.json();
+          // Trigger download
+          const link = document.createElement('a');
+          link.href = `http://localhost:3333${result.downloadUrl}`;
+          link.download = result.filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+        }
+      } catch (e) {
+        console.error('Failed to export scene:', scene.title, e);
+      }
+    }
+  }, [session, selectedScenes, analyzedAssetId]);
+
   // Handle adding text overlay
   const handleAddText = useCallback(() => {
     // Create a text clip on T1 track at current playhead
@@ -520,11 +634,11 @@ export default function Home() {
     setAspectRatio(prev => {
       const newRatio = prev === '16:9' ? '9:16' : '16:9';
       // Update project settings with new dimensions
-      if (newRatio === '9:16') {
-        setSettings(s => ({ ...s, width: 1080, height: 1920 }));
-      } else {
-        setSettings(s => ({ ...s, width: 1920, height: 1080 }));
-      }
+      const newSettings = newRatio === '9:16'
+        ? { width: 1080, height: 1920 }
+        : { width: 1920, height: 1080 };
+
+      setSettings(s => ({ ...s, ...newSettings }));
       return newRatio;
     });
   }, [setSettings]);
@@ -2063,17 +2177,26 @@ export default function Home() {
     }
 
     try {
+      // Determine the correct settings based on aspect ratio
+      const exportSettings = aspectRatio === '9:16'
+        ? { ...settings, width: 1080, height: 1920 }
+        : { ...settings, width: 1920, height: 1080 };
+
+      console.log('Exporting with settings:', exportSettings.width, 'x', exportSettings.height);
+
       // For 9:16 aspect ratio, include frame template and overlay assets
       const frameTemplateForRender = aspectRatio === '9:16' ? currentFrameTemplate : null;
       const overlayAssetsForRender = aspectRatio === '9:16'
-        ? overlayAssets.map(a => ({ id: a.id, type: a.type, dataUrl: a.dataUrl }))
+        ? overlayAssets.map(a => ({ id: a.id, type: a.type, url: a.url }))
         : undefined;
 
-      const downloadUrl = await renderProject(false, frameTemplateForRender, overlayAssetsForRender);
+      // Pass exportSettings explicitly to renderProject to ensure correct dimensions
+      const downloadUrl = await renderProject(false, frameTemplateForRender, overlayAssetsForRender, exportSettings);
+
       // Trigger download
       const link = document.createElement('a');
       link.href = downloadUrl;
-      link.download = 'export.mp4';
+      link.download = aspectRatio === '9:16' ? 'export-vertical.mp4' : 'export.mp4';
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
@@ -2081,7 +2204,7 @@ export default function Home() {
       console.error('Export failed:', error);
       alert(`Export failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
-  }, [clips.length, renderProject, aspectRatio, currentFrameTemplate, overlayAssets]);
+  }, [clips.length, renderProject, aspectRatio, currentFrameTemplate, overlayAssets, settings]);
 
   // Edit an existing animation with a new prompt
   const handleEditAnimation = useCallback(async (
@@ -2259,6 +2382,50 @@ export default function Home() {
               )}
             </>
           )}
+          <button
+            onClick={() => setShowScenePanel(!showScenePanel)}
+            className={`p-2 rounded-lg transition-colors ${
+              showScenePanel
+                ? 'bg-orange-500 text-white'
+                : 'bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700'
+            }`}
+            title="Smart Scene Detection"
+          >
+            <Layers className={`w-4 h-4 ${showScenePanel ? '' : 'text-zinc-600 dark:text-zinc-400'}`} />
+          </button>
+          {/* AI Feature Buttons */}
+          <button
+            onClick={() => setShowBrollPanel(!showBrollPanel)}
+            className={`p-2 rounded-lg transition-colors ${
+              showBrollPanel
+                ? 'bg-blue-500 text-white'
+                : 'bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700'
+            }`}
+            title="AI B-Roll Suggestions"
+          >
+            <Image className={`w-4 h-4 ${showBrollPanel ? '' : 'text-zinc-600 dark:text-zinc-400'}`} />
+          </button>
+          <button
+            onClick={() => setShowThumbnailPanel(true)}
+            className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
+            title="AI Thumbnail Generator"
+          >
+            <Camera className="w-4 h-4 text-zinc-600 dark:text-zinc-400" />
+          </button>
+          <button
+            onClick={() => setShowViralPanel(true)}
+            className="p-2 bg-gradient-to-r from-pink-500/20 to-purple-500/20 hover:from-pink-500/30 hover:to-purple-500/30 rounded-lg transition-colors border border-pink-500/30"
+            title="Make it Viral"
+          >
+            <Zap className="w-4 h-4 text-pink-400" />
+          </button>
+          <button
+            onClick={() => setShowRepurposePanel(true)}
+            className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
+            title="Content Repurposing (Shorts)"
+          >
+            <Scissors className="w-4 h-4 text-zinc-600 dark:text-zinc-400" />
+          </button>
           <button
             onClick={() => setShowKeyboardShortcuts(true)}
             className="p-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 rounded-lg transition-colors"
@@ -2638,6 +2805,149 @@ export default function Home() {
         isOpen={showKeyboardShortcuts}
         onClose={() => setShowKeyboardShortcuts(false)}
       />
+
+      {/* Scene Detection Panel (floating side panel) */}
+      {showScenePanel && (
+        <div className="fixed right-0 top-16 bottom-0 w-80 z-40 shadow-xl">
+          <SceneDetectionPanel
+            scenes={scenes}
+            loading={scenesLoading}
+            error={scenesError}
+            currentTime={currentTime}
+            projectDuration={getDuration()}
+            onDetectScenes={detectScenes}
+            onToggleSelection={toggleSceneSelection}
+            onSelectAll={selectAllScenes}
+            onUpdateScene={(id, updates) => updateSceneBoundary(id, updates)}
+            onMergeScenes={mergeScenes}
+            onSplitScene={splitDetectedScene}
+            onSplitAll={handleSplitAllScenes}
+            onExportSelected={handleExportSelectedScenes}
+            onSeekTo={(time) => {
+              setCurrentTime(time);
+              videoPreviewRef.current?.seekTo(time);
+            }}
+            onClearScenes={clearScenes}
+            onClose={() => setShowScenePanel(false)}
+          />
+        </div>
+      )}
+
+      {/* B-Roll Suggestions Panel (floating side panel) */}
+      {showBrollPanel && (
+        <div className="fixed right-0 top-16 bottom-0 w-80 z-40 shadow-xl">
+          <BrollSuggestionsPanel
+            suggestions={brollSuggestions.suggestions}
+            loading={brollSuggestions.loading}
+            applying={brollSuggestions.applying}
+            error={brollSuggestions.error}
+            onFetchSuggestions={brollSuggestions.fetchSuggestions}
+            onApplySuggestion={brollSuggestions.applySuggestion}
+            onClear={brollSuggestions.clear}
+            onClose={() => setShowBrollPanel(false)}
+            onAddToTimeline={async (assetId, timestamp, duration) => {
+              // Refresh assets first to get the new B-roll asset
+              await refreshAssets();
+
+              // Add B-roll clip to V2 track at the specified timestamp
+              const newClip: TimelineClip = {
+                id: `clip-broll-${Date.now()}`,
+                assetId: assetId,
+                trackId: 'V2', // Overlay track
+                start: timestamp,
+                duration: duration,
+                inPoint: 0,
+                outPoint: duration,
+                transform: { scale: 0.3, x: 0, y: 0, opacity: 1 },
+              };
+              setClips(prev => [...prev, newClip]);
+              console.log('[Home] Added B-roll clip to timeline:', newClip);
+            }}
+          />
+        </div>
+      )}
+
+      {/* AI Thumbnail Generator Panel (modal) */}
+      {showThumbnailPanel && (
+        <ThumbnailGeneratorPanel
+          variants={thumbnailGenerator.variants}
+          loading={thumbnailGenerator.loading}
+          error={thumbnailGenerator.error}
+          selectedVariant={thumbnailGenerator.selectedVariant}
+          recommendedIndex={thumbnailGenerator.recommendedIndex}
+          explanation={thumbnailGenerator.explanation}
+          prompt={thumbnailGenerator.prompt}
+          onSetSelectedVariant={thumbnailGenerator.setSelectedVariant}
+          onGenerate={thumbnailGenerator.generate}
+          onDownload={thumbnailGenerator.downloadVariant}
+          onClear={thumbnailGenerator.clearVariants}
+          onClose={() => setShowThumbnailPanel(false)}
+        />
+      )}
+
+      {/* Viral Edit Panel (modal) */}
+      {showViralPanel && (
+        <ViralEditPanel
+          processing={viralEdit.processing}
+          progress={viralEdit.progress}
+          error={viralEdit.error}
+          emphasisPoints={viralEdit.emphasisPoints}
+          slowSections={viralEdit.slowSections}
+          result={viralEdit.result}
+          hasCaptions={clips.some(c => c.trackId === 'T1')}
+          onApplyViralEdits={viralEdit.applyViralEdits}
+          onClear={viralEdit.clear}
+          onClose={() => setShowViralPanel(false)}
+          onApplyZoomCut={(timestamp, scale) => {
+            // Apply zoom cut to V1 clip at timestamp
+            const clipAtTime = clips.find(c =>
+              c.trackId === 'V1' &&
+              c.start <= timestamp &&
+              c.start + c.duration >= timestamp
+            );
+            if (clipAtTime) {
+              setClips(prev => prev.map(c =>
+                c.id === clipAtTime.id
+                  ? { ...c, transform: { ...c.transform, scale: scale } }
+                  : c
+              ));
+            }
+          }}
+          onUpdateCaptionStyle={(style) => {
+            // Update all caption clips with karaoke animation style
+            const captionClips = clips.filter(c => c.trackId === 'T1');
+            captionClips.forEach(clip => {
+              updateCaptionStyle(clip.id, {
+                animation: style.animation as 'none' | 'pop' | 'bounce' | 'karaoke',
+                highlightColor: style.highlightColor,
+              });
+            });
+            saveProject();
+          }}
+        />
+      )}
+
+      {/* Content Repurposing Panel (modal) */}
+      {showRepurposePanel && (
+        <ContentRepurposePanel
+          candidates={contentRepurpose.candidates}
+          exports={contentRepurpose.exports}
+          analyzing={contentRepurpose.analyzing}
+          exporting={contentRepurpose.exporting}
+          exportProgress={contentRepurpose.exportProgress}
+          error={contentRepurpose.error}
+          selectedCount={contentRepurpose.selectedCount}
+          onAnalyze={contentRepurpose.analyzeForShorts}
+          onToggleCandidate={contentRepurpose.toggleCandidate}
+          onSelectAll={contentRepurpose.selectAll}
+          onUpdateCandidate={contentRepurpose.updateCandidate}
+          onExportSelected={contentRepurpose.exportSelected}
+          onDownloadExport={contentRepurpose.downloadExport}
+          onDownloadAll={contentRepurpose.downloadAll}
+          onClear={contentRepurpose.clear}
+          onClose={() => setShowRepurposePanel(false)}
+        />
+      )}
 
     </div>
   );

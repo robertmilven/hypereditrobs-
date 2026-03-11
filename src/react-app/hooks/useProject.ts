@@ -126,6 +126,19 @@ export interface FrameTemplate {
   videoY?: number;
 }
 
+// Scene detected from transcript analysis (Smart Scene Detection)
+export interface DetectedScene {
+  id: string;
+  title: string;              // AI-generated scene title
+  startTime: number;          // Start timestamp in seconds
+  endTime: number;            // End timestamp in seconds
+  duration: number;           // Computed: endTime - startTime
+  thumbnailUrl?: string;      // Generated from video frame
+  confidence: number;         // 0-1 confidence score from AI
+  isVisualBreak?: boolean;    // True if also detected by visual scene detection
+  selected?: boolean;         // For UI selection state
+}
+
 // Project state
 export interface ProjectState {
   tracks: Track[];
@@ -804,21 +817,24 @@ export function useProject() {
   }, [captionData]);
 
   // Internal save helper (no debounce) — can accept override arrays for immediate saves
-  // Use overrideClips/overrideCaptionData when calling right after setClips/setCaptionData,
+  // Use overrides when calling right after setState calls,
   // since those state updates haven't propagated to the refs yet.
   const saveProjectNow = useCallback(async (
     overrideClips?: TimelineClip[],
     overrideCaptionData?: Record<string, CaptionData>,
+    overrideSettings?: ProjectSettings,
   ): Promise<void> => {
     if (!session) return;
     try {
+      const settingsToSave = overrideSettings ?? settingsRef.current;
+      console.log('[Project] Saving with settings:', settingsToSave.width, 'x', settingsToSave.height);
       await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tracks: tracksRef.current,
           clips: overrideClips ?? clipsRef.current,
-          settings: settingsRef.current,
+          settings: settingsToSave,
           captionData: overrideCaptionData ?? captionDataRef.current,
         }),
       });
@@ -912,10 +928,12 @@ export function useProject() {
   // Render project
   // Uses refs to always get latest state
   // Optional frameTemplate and overlayAssets for 9:16 vertical video rendering
+  // Optional settingsOverride to explicitly set dimensions (bypasses ref timing issues)
   const renderProject = useCallback(async (
     preview = false,
     frameTemplate?: FrameTemplate | null,
-    overlayAssets?: Array<{ id: string; type: 'image' | 'video'; dataUrl: string }>
+    overlayAssets?: Array<{ id: string; type: 'image' | 'video'; dataUrl: string }>,
+    settingsOverride?: ProjectSettings
   ): Promise<string> => {
     if (!session) throw new Error('No session');
 
@@ -923,15 +941,18 @@ export function useProject() {
     setStatus(preview ? 'Rendering preview...' : 'Rendering export...');
 
     try {
-      // Save project first - use refs to get latest state
-      // Include frame template data if provided (for 9:16 vertical video)
+      // Use explicit settings if provided, otherwise fall back to ref
+      const settingsToUse = settingsOverride ?? settingsRef.current;
+      console.log('[Render] Using settings:', settingsToUse.width, 'x', settingsToUse.height);
+
+      // Save project first - include frame template data if provided (for 9:16 vertical video)
       await fetch(`${LOCAL_FFMPEG_URL}/session/${session.sessionId}/project`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tracks: tracksRef.current,
           clips: clipsRef.current,
-          settings: settingsRef.current,
+          settings: settingsToUse,
           captionData: captionDataRef.current,
           frameTemplate: frameTemplate || undefined,
           overlayAssets: overlayAssets || undefined,
