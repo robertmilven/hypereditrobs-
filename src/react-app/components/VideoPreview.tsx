@@ -159,7 +159,7 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
     getVideoElement: () => videoRef.current,
   }));
 
-  // Reload video when source URL changes (e.g., after dead air removal)
+  // Reload video when source URL changes (e.g., clip boundary or after dead air removal)
   // Using stable key + manual load() preserves the audio permission from user gesture
   useEffect(() => {
     const video = videoRef.current;
@@ -173,10 +173,21 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
       video.src = baseLayerUrl;
       video.load();
       loadedSrcRef.current = baseLayerUrl;
-    }
-  }, [baseLayerUrl]);
 
-  // Seek control for base video (only when paused/scrubbing)
+      // After loading a new source, seek to correct position and resume playback
+      // video.load() resets the element, so .play() must be called again
+      video.addEventListener('loadeddata', () => {
+        if (baseLayerClipTime !== undefined) {
+          video.currentTime = baseLayerClipTime;
+        }
+        if (isPlaying) {
+          video.play().catch(() => {});
+        }
+      }, { once: true });
+    }
+  }, [baseLayerUrl, baseLayerClipTime, isPlaying]);
+
+  // Seek control for base video (when paused/scrubbing)
   useEffect(() => {
     const video = videoRef.current;
     if (!video || baseLayerClipTime === undefined) return;
@@ -184,6 +195,20 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
 
     if (Math.abs(video.currentTime - baseLayerClipTime) > 0.1) {
       video.currentTime = baseLayerClipTime;
+    }
+  }, [baseLayerClipTime, isPlaying]);
+
+  // Sync base video during playback — correct drift so audio/video don't stall
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || baseLayerClipTime === undefined) return;
+    if (!isPlaying) return;
+
+    const drift = Math.abs(video.currentTime - baseLayerClipTime);
+    if (drift > 0.15) {
+      video.currentTime = baseLayerClipTime;
+      // Re-trigger play in case seeking paused it
+      video.play().catch(() => {});
     }
   }, [baseLayerClipTime, isPlaying]);
 
@@ -215,9 +240,8 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
 
   // Sync overlay video and audio seeking when scrubbing
   useEffect(() => {
-    if (isPlaying) return; // Don't interfere during playback
+    if (isPlaying) return;
 
-    // Find overlay video and audio layers and sync their time
     const overlayMediaLayers = layers.filter(
       l => (l.type === 'video' && l.trackId !== 'V1') || l.type === 'audio'
     );
@@ -227,6 +251,26 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
       if (mediaEl && layer.clipTime !== undefined) {
         if (Math.abs(mediaEl.currentTime - layer.clipTime) > 0.1) {
           mediaEl.currentTime = layer.clipTime;
+        }
+      }
+    });
+  }, [layers, isPlaying]);
+
+  // Sync overlay videos/audio during playback — correct drift
+  useEffect(() => {
+    if (!isPlaying) return;
+
+    const overlayMediaLayers = layers.filter(
+      l => (l.type === 'video' && l.trackId !== 'V1') || l.type === 'audio'
+    );
+
+    overlayMediaLayers.forEach((layer) => {
+      const mediaEl = overlayVideoRefs.current.get(layer.id);
+      if (mediaEl && layer.clipTime !== undefined) {
+        const drift = Math.abs(mediaEl.currentTime - layer.clipTime);
+        if (drift > 0.15) {
+          mediaEl.currentTime = layer.clipTime;
+          mediaEl.play().catch(() => {});
         }
       }
     });

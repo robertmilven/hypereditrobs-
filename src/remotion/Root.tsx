@@ -1,6 +1,8 @@
 import React from 'react';
 import { Composition } from 'remotion';
 import { DynamicAnimation } from './DynamicAnimation';
+import { YouTubeIntro } from './YouTubeIntro';
+import { YouTubeIntroEpic } from './YouTubeIntroEpic';
 
 // Props passed from the CLI via --props
 export interface DynamicAnimationProps {
@@ -190,6 +192,22 @@ export const RemotionRoot: React.FC = () => {
             durationInFrames: calculateDuration(props),
           };
         }}
+      />
+      <Composition
+        id="YouTubeIntro"
+        component={YouTubeIntro}
+        durationInFrames={450}
+        fps={30}
+        width={1920}
+        height={1080}
+      />
+      <Composition
+        id="YouTubeIntroEpic"
+        component={YouTubeIntroEpic}
+        durationInFrames={540}
+        fps={30}
+        width={1920}
+        height={1080}
       />
     </>
   );

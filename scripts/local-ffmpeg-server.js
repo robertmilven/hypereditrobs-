@@ -4152,16 +4152,15 @@ async function generateImageWithGemini(prompt, apiKey, outputPath) {
       return false;
     }
 
-    // Use flux/dev for higher quality (slower but much better results)
-    const result = await fal.subscribe('fal-ai/flux/dev', {
+    // Use nano-banana-pro for higher quality results
+    const result = await fal.run('fal-ai/nano-banana-pro', {
       input: {
         prompt: `${prompt}. Professional quality, high resolution, suitable for video production.`,
-        image_size: 'square_hd',  // Higher resolution
         num_images: 1,
-        guidance_scale: 3.5,  // Better prompt adherence
-        num_inference_steps: 28,  // More steps = higher quality
+        aspect_ratio: '1:1',
+        resolution: '1K',
+        output_format: 'png',
       },
-      logs: false,
     });
 
     // Debug: log the response structure
@@ -5837,15 +5836,14 @@ Return ONLY the prompt text, no explanation or formatting.`
         try {
           console.log(`[${jobId}] Generating AI thumbnail ${i + 1}/${variantsToGenerate}...`);
 
-          const result = await fal.subscribe('fal-ai/flux/dev', {
+          const result = await fal.run('fal-ai/nano-banana-pro', {
             input: {
-              prompt: `${thumbnailPrompt}. YouTube thumbnail style, 16:9 aspect ratio, no text.`,
-              image_size: { width: 1920, height: 1080 },
+              prompt: `${thumbnailPrompt}. YouTube thumbnail style, no text in image.`,
               num_images: 1,
-              guidance_scale: 3.5,
-              num_inference_steps: 28,
+              aspect_ratio: '16:9',
+              resolution: '1K',
+              output_format: 'png',
             },
-            logs: false,
           });
 
           const images = result?.images || result?.data?.images || [];
