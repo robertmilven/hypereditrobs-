@@ -93,7 +93,7 @@ export default function AIToolsDropdown({ onSelect, activePanel }: AIToolsDropdo
 
       {/* Dropdown Menu */}
       {isOpen && (
-        <div className="absolute right-0 top-full mt-2 w-72 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl overflow-hidden z-50">
+        <div className="absolute right-0 top-full mt-2 w-72 bg-zinc-900 border border-zinc-700 rounded-xl shadow-2xl overflow-hidden z-[9999]">
           {/* Header */}
           <div className="px-4 py-2 border-b border-zinc-800 bg-gradient-to-r from-purple-500/10 to-pink-500/10">
             <span className="text-xs font-medium text-zinc-400">AI-Powered Tools</span>

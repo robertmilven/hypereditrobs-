@@ -11,7 +11,7 @@ import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPane
 import TimelineTabs from '@/react-app/components/TimelineTabs';
 import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
-import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, HelpCircle, Layers } from 'lucide-react';
+import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, HelpCircle, Layers, Loader2 } from 'lucide-react';
 import KeyboardShortcuts from '@/react-app/components/KeyboardShortcuts';
 import ProjectTemplates from '@/react-app/components/ProjectTemplates';
 import FrameTemplatePanel from '@/react-app/components/FrameTemplatePanel';
@@ -50,6 +50,7 @@ export default function Home() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [chapterData, setChapterData] = useState<ChapterData | null>(null);
   const [showChapters, setShowChapters] = useState(false);
+  const [isGeneratingChapters, setIsGeneratingChapters] = useState(false);
   const [copied, setCopied] = useState(false);
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [aspectRatio, setAspectRatio] = useState<'16:9' | '9:16'>('16:9');
@@ -781,22 +782,70 @@ export default function Home() {
     await refreshAssets();
   }, [session, assets, clips, selectedClipId, refreshAssets]);
 
-  // Handle chapter generation
+  // Handle chapter generation - works with both legacy and new session systems
   const handleGenerateChapters = useCallback(async () => {
-    if (!legacySession) {
-      alert('Please upload a video using the AI Edit panel first');
+    setIsGeneratingChapters(true);
+
+    // Try legacy session first
+    if (legacySession) {
+      try {
+        const result = await legacyGenerateChapters();
+        setChapterData(result);
+        setShowChapters(true);
+      } catch (error) {
+        console.error('Chapter generation failed:', error);
+        alert(`Failed to generate chapters: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      } finally {
+        setIsGeneratingChapters(false);
+      }
       return;
     }
 
-    try {
-      const result = await legacyGenerateChapters();
-      setChapterData(result);
-      setShowChapters(true);
-    } catch (error) {
-      console.error('Chapter generation failed:', error);
-      alert(`Failed to generate chapters: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    // Try new session system
+    if (session?.sessionId) {
+      const videoAsset = assets.find(a => a.type === 'video');
+      if (!videoAsset) {
+        alert('Please add a video to the timeline first');
+        setIsGeneratingChapters(false);
+        return;
+      }
+
+      try {
+        // Build transcript from caption data if available
+        let transcript = '';
+        const captionClips = clips.filter(c => c.trackId.startsWith('T'));
+        for (const clip of captionClips) {
+          const cd = captionData[clip.id];
+          if (cd?.words) {
+            transcript += cd.words.map(w => `[${w.start.toFixed(2)}] ${w.text}`).join('\n') + '\n';
+          }
+        }
+
+        const response = await fetch(`http://localhost:3333/session/${session.sessionId}/chapters`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(transcript ? { transcript } : {}),
+        });
+
+        if (!response.ok) {
+          throw new Error(`Server error: ${response.status}`);
+        }
+
+        const result = await response.json();
+        setChapterData(result);
+        setShowChapters(true);
+      } catch (error) {
+        console.error('Chapter generation failed:', error);
+        alert(`Failed to generate chapters: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      } finally {
+        setIsGeneratingChapters(false);
+      }
+      return;
     }
-  }, [legacySession, legacyGenerateChapters]);
+
+    alert('Please upload a video first');
+    setIsGeneratingChapters(false);
+  }, [legacySession, legacyGenerateChapters, session, assets, clips, captionData]);
 
   // Copy chapters to clipboard
   const handleCopyChapters = useCallback(() => {
@@ -2379,7 +2428,7 @@ export default function Home() {
   return (
     <div className="flex flex-col h-screen bg-zinc-950 text-white overflow-hidden">
       {/* Header */}
-      <header className="flex items-center justify-between px-6 py-3 bg-zinc-100/80 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800/50 backdrop-blur-sm">
+      <header className="relative z-50 flex items-center justify-between px-6 py-3 bg-zinc-100/80 dark:bg-zinc-900/50 border-b border-zinc-200 dark:border-zinc-800/50 backdrop-blur-sm">
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2">
             <div className="w-8 h-8 bg-gradient-to-br from-orange-500 to-amber-500 rounded-lg flex items-center justify-center">
@@ -2412,11 +2461,22 @@ export default function Home() {
             <>
               <button
                 onClick={handleGenerateChapters}
-                disabled={isProcessing || !legacySession}
-                className="px-4 py-2 bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-sm font-medium transition-colors flex items-center gap-2"
+                disabled={isProcessing || isGeneratingChapters}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-2 ${
+                  isGeneratingChapters
+                    ? 'bg-purple-600 text-white'
+                    : legacySession || assets.some(a => a.type === 'video')
+                      ? 'bg-zinc-200 dark:bg-zinc-800 hover:bg-zinc-300 dark:hover:bg-zinc-700'
+                      : 'bg-zinc-300 dark:bg-zinc-800/50 text-zinc-500 cursor-help'
+                } disabled:opacity-70 disabled:cursor-not-allowed`}
+                title={isGeneratingChapters ? 'Generating chapters...' : legacySession || assets.some(a => a.type === 'video') ? 'Generate YouTube chapters from video' : 'Upload a video first to use this feature'}
               >
-                <ListOrdered className="w-4 h-4" />
-                Chapters
+                {isGeneratingChapters ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <ListOrdered className="w-4 h-4" />
+                )}
+                {isGeneratingChapters ? 'Generating...' : 'Chapters'}
               </button>
               {clips.length > 0 && (
                 <ExportPresetsDropdown
@@ -2557,7 +2617,13 @@ export default function Home() {
                 onSelect={handleAssetSelect}
                 selectedAssetId={selectedAssetId}
                 uploading={loading}
-                onOpenGifSearch={() => setShowGifSearch(true)}
+                onOpenGifSearch={() => {
+                  if (!session?.sessionId) {
+                    alert('Please upload a video first to use GIF search');
+                    return;
+                  }
+                  setShowGifSearch(true);
+                }}
               />
             </div>
 
@@ -2587,6 +2653,10 @@ export default function Home() {
                   <CaptionPropertiesPanel
                     captionData={selectedCaptionData}
                     onUpdateStyle={(styleUpdates) => handleUpdateCaptionStyle(selectedClipId, styleUpdates)}
+                    onUpdateText={(newWords) => {
+                      updateCaptionWords(selectedClipId, newWords);
+                      saveProject();
+                    }}
                     onClose={() => setSelectedClipId(null)}
                   />
                 ) : (

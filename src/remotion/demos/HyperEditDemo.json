@@ -1,0 +1,165 @@
+{
+  "scenes": [
+    {
+      "id": "intro",
+      "type": "title",
+      "duration": 90,
+      "content": {
+        "title": "HyperEdit",
+        "subtitle": "AI-Powered Video Editing",
+        "color": "#ffffff",
+        "backgroundColor": "#0a0a0a",
+        "camera": {
+          "type": "zoom-in",
+          "intensity": 0.2
+        }
+      },
+      "transition": {
+        "type": "fade",
+        "duration": 15
+      }
+    },
+    {
+      "id": "problem",
+      "type": "text",
+      "duration": 90,
+      "content": {
+        "title": "Video Editing Takes Forever",
+        "subtitle": "Captions, cuts, B-roll, thumbnails...",
+        "color": "#ff6b6b",
+        "backgroundColor": "#1a1a1a"
+      },
+      "transition": {
+        "type": "swipe-left",
+        "duration": 15
+      }
+    },
+    {
+      "id": "solution",
+      "type": "text",
+      "duration": 75,
+      "content": {
+        "title": "What if AI did the heavy lifting?",
+        "subtitle": "",
+        "color": "#a855f7",
+        "backgroundColor": "#0a0a0a"
+      },
+      "transition": {
+        "type": "fade",
+        "duration": 15
+      }
+    },
+    {
+      "id": "features-1",
+      "type": "features",
+      "duration": 120,
+      "content": {
+        "title": "AI-Powered Features",
+        "items": [
+          { "icon": "🎤", "label": "Auto Captions", "description": "Word-level timing with editing" },
+          { "icon": "✂️", "label": "Scene Detection", "description": "Automatic scene boundaries" },
+          { "icon": "🎬", "label": "B-Roll Suggestions", "description": "AI finds perfect clips" }
+        ],
+        "color": "#22c55e",
+        "backgroundColor": "#0f1f15"
+      },
+      "transition": {
+        "type": "swipe-up",
+        "duration": 15
+      }
+    },
+    {
+      "id": "features-2",
+      "type": "features",
+      "duration": 120,
+      "content": {
+        "title": "Create & Export",
+        "items": [
+          { "icon": "📸", "label": "Thumbnail Generator", "description": "AI-designed thumbnails" },
+          { "icon": "🔥", "label": "Make it Viral", "description": "Auto-enhance your content" },
+          { "icon": "📱", "label": "Export Presets", "description": "YouTube, TikTok, Reels" }
+        ],
+        "color": "#f59e0b",
+        "backgroundColor": "#1f1a0f"
+      },
+      "transition": {
+        "type": "swipe-left",
+        "duration": 15
+      }
+    },
+    {
+      "id": "features-3",
+      "type": "features",
+      "duration": 120,
+      "content": {
+        "title": "Pro Tools",
+        "items": [
+          { "icon": "🎵", "label": "Audio Waveforms", "description": "Visual audio editing" },
+          { "icon": "📑", "label": "Smart Chapters", "description": "AI-generated chapters" },
+          { "icon": "⌨️", "label": "Command Bar", "description": "Cmd+K for everything" }
+        ],
+        "color": "#06b6d4",
+        "backgroundColor": "#0f1a1f"
+      },
+      "transition": {
+        "type": "swipe-right",
+        "duration": 15
+      }
+    },
+    {
+      "id": "remotion",
+      "type": "text",
+      "duration": 90,
+      "content": {
+        "title": "Remotion Generator",
+        "subtitle": "Create custom animations with AI",
+        "color": "#ec4899",
+        "backgroundColor": "#1f0f1a"
+      },
+      "transition": {
+        "type": "zoom-in",
+        "duration": 15
+      }
+    },
+    {
+      "id": "stats",
+      "type": "stats",
+      "duration": 120,
+      "content": {
+        "title": "Built for Speed",
+        "stats": [
+          { "value": "10x", "label": "Faster Editing", "numericValue": 10, "suffix": "x" },
+          { "value": "100%", "label": "AI Powered", "numericValue": 100, "suffix": "%" },
+          { "value": "0", "label": "Hassle", "numericValue": 0 }
+        ],
+        "color": "#8b5cf6",
+        "backgroundColor": "#0a0a0a"
+      },
+      "transition": {
+        "type": "fade",
+        "duration": 15
+      }
+    },
+    {
+      "id": "cta",
+      "type": "title",
+      "duration": 90,
+      "content": {
+        "title": "Start Editing Smarter",
+        "subtitle": "HyperEdit - Your AI Video Assistant",
+        "color": "#ffffff",
+        "backgroundColor": "#0a0a0a",
+        "camera": {
+          "type": "zoom-out",
+          "intensity": 0.15
+        }
+      },
+      "transition": {
+        "type": "fade",
+        "duration": 30
+      }
+    }
+  ],
+  "backgroundColor": "#0a0a0a",
+  "totalDuration": 915
+}

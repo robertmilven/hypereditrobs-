@@ -48,6 +48,7 @@ const FREE_RESOURCES = [
   { name: 'Pexels', url: 'https://www.pexels.com/', icon: Video, color: 'from-green-500 to-emerald-500', desc: 'Free videos & photos' },
   { name: 'Pixabay', url: 'https://pixabay.com/', icon: Image, color: 'from-green-600 to-teal-500', desc: 'Videos, images, music' },
   { name: 'Unsplash', url: 'https://unsplash.com/', icon: Image, color: 'from-gray-600 to-gray-500', desc: 'High-quality photos' },
+  { name: 'GIPHY', url: 'https://giphy.com/', icon: Sparkles, color: 'from-violet-500 to-purple-500', desc: 'GIFs & stickers' },
   { name: 'Mixkit', url: 'https://mixkit.co/', icon: Video, color: 'from-purple-500 to-indigo-500', desc: 'Video clips & music' },
   { name: 'Freesound', url: 'https://freesound.org/', icon: Volume2, color: 'from-orange-500 to-red-500', desc: 'Sound effects & audio' },
   { name: 'LottieFiles', url: 'https://lottiefiles.com/', icon: Palette, color: 'from-cyan-500 to-blue-500', desc: 'Free animations' },
@@ -291,11 +292,16 @@ export default function AssetLibrary({
                   href={resource.url}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className={`flex items-center gap-2 px-2 py-1.5 bg-gradient-to-r ${resource.color} rounded text-[10px] font-medium text-white hover:opacity-90 transition-opacity`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    window.open(resource.url, '_blank', 'noopener,noreferrer');
+                  }}
+                  className={`flex items-center gap-2 px-2 py-1.5 bg-gradient-to-r ${resource.color} rounded text-[10px] font-medium text-white hover:opacity-90 transition-opacity cursor-pointer`}
                   title={resource.desc}
                 >
                   <Icon className="w-3 h-3" />
-                  {resource.name}
+                  <span className="flex-1">{resource.name}</span>
+                  <ExternalLink className="w-2.5 h-2.5 opacity-60" />
                 </a>
               );
             })}

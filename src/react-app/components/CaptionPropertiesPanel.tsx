@@ -1,10 +1,11 @@
-import { useCallback } from 'react';
-import { Type, X, Palette, AlignCenter } from 'lucide-react';
-import type { CaptionStyle, CaptionData } from '@/react-app/hooks/useProject';
+import { useCallback, useState, useEffect } from 'react';
+import { Type, X, Palette, AlignCenter, Edit3, Check } from 'lucide-react';
+import type { CaptionStyle, CaptionData, CaptionWord } from '@/react-app/hooks/useProject';
 
 interface CaptionPropertiesPanelProps {
   captionData: CaptionData;
   onUpdateStyle: (styleUpdates: Partial<CaptionStyle>) => void;
+  onUpdateText?: (newWords: CaptionWord[]) => void;
   onClose: () => void;
 }
 
@@ -36,9 +37,42 @@ const POSITION_OPTIONS = [
 export default function CaptionPropertiesPanel({
   captionData,
   onUpdateStyle,
+  onUpdateText,
   onClose,
 }: CaptionPropertiesPanelProps) {
   const style = captionData.style;
+  const [isEditingText, setIsEditingText] = useState(false);
+  const [editedText, setEditedText] = useState('');
+
+  // Initialize edited text when caption data changes
+  useEffect(() => {
+    setEditedText(captionData.words.map(w => w.text).join(' '));
+  }, [captionData.words]);
+
+  const handleSaveText = useCallback(() => {
+    if (!onUpdateText) return;
+
+    // Parse the edited text back into words while preserving timing
+    const newWords = editedText.split(/\s+/).filter(Boolean);
+    const oldWords = captionData.words;
+
+    // Create new word objects, preserving timing from original words where possible
+    const updatedWords: CaptionWord[] = newWords.map((text, index) => {
+      if (index < oldWords.length) {
+        // Preserve timing from original word
+        return { ...oldWords[index], text };
+      } else {
+        // New word added - estimate timing based on last word
+        const lastWord = oldWords[oldWords.length - 1];
+        const avgDuration = lastWord ? (lastWord.end - lastWord.start) : 0.3;
+        const start = lastWord ? lastWord.end + 0.1 : 0;
+        return { text, start, end: start + avgDuration };
+      }
+    });
+
+    onUpdateText(updatedWords);
+    setIsEditingText(false);
+  }, [editedText, captionData.words, onUpdateText]);
 
   const handleFontChange = useCallback((value: string) => {
     onUpdateStyle({ fontFamily: value });
@@ -94,13 +128,63 @@ export default function CaptionPropertiesPanel({
         </button>
       </div>
 
-      {/* Caption preview */}
+      {/* Caption Text - Editable */}
       <div className="px-3 py-2 border-b border-zinc-800/50">
-        <div className="flex items-center gap-2 text-xs text-white font-medium">
-          <Type className="w-3.5 h-3.5 text-purple-400" />
-          <span className="truncate">{textPreview || 'Caption'}</span>
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center gap-2 text-xs text-white font-medium">
+            <Type className="w-3.5 h-3.5 text-purple-400" />
+            <span>Caption Text</span>
+          </div>
+          {onUpdateText && (
+            isEditingText ? (
+              <button
+                onClick={handleSaveText}
+                className="flex items-center gap-1 px-2 py-0.5 bg-green-600 hover:bg-green-500 rounded text-[10px] text-white transition-colors"
+                title="Save changes"
+              >
+                <Check className="w-3 h-3" />
+                Save
+              </button>
+            ) : (
+              <button
+                onClick={() => setIsEditingText(true)}
+                className="flex items-center gap-1 px-2 py-0.5 bg-zinc-700 hover:bg-zinc-600 rounded text-[10px] text-zinc-300 transition-colors"
+                title="Edit caption text"
+              >
+                <Edit3 className="w-3 h-3" />
+                Edit
+              </button>
+            )
+          )}
         </div>
-        <div className="text-[10px] text-zinc-500 mt-0.5">
+        {isEditingText ? (
+          <textarea
+            value={editedText}
+            onChange={(e) => setEditedText(e.target.value)}
+            className="w-full px-2 py-1.5 bg-zinc-800 border border-purple-500 rounded text-xs text-white resize-none focus:outline-none focus:ring-1 focus:ring-purple-500"
+            rows={3}
+            autoFocus
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleSaveText();
+              }
+              if (e.key === 'Escape') {
+                setIsEditingText(false);
+                setEditedText(captionData.words.map(w => w.text).join(' '));
+              }
+            }}
+          />
+        ) : (
+          <div
+            className="px-2 py-1.5 bg-zinc-800/50 rounded text-xs text-zinc-300 cursor-pointer hover:bg-zinc-800 transition-colors"
+            onClick={() => onUpdateText && setIsEditingText(true)}
+            title={onUpdateText ? "Click to edit" : undefined}
+          >
+            {textPreview || 'Caption'}
+          </div>
+        )}
+        <div className="text-[10px] text-zinc-500 mt-1">
           {captionData.words.length} words
         </div>
       </div>
