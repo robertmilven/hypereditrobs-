@@ -9,7 +9,7 @@ import GifSearchPanel from '@/react-app/components/GifSearchPanel';
 import ResizablePanel from '@/react-app/components/ResizablePanel';
 import ResizableVerticalPanel from '@/react-app/components/ResizableVerticalPanel';
 import TimelineTabs from '@/react-app/components/TimelineTabs';
-import { useProject, Asset, TimelineClip, CaptionStyle } from '@/react-app/hooks/useProject';
+import { useProject, Asset, TimelineClip, CaptionStyle, TransitionType } from '@/react-app/hooks/useProject';
 import { useVideoSession } from '@/react-app/hooks/useVideoSession';
 import { Sparkles, ListOrdered, Copy, Check, X, Download, Play, Palette, Film, HelpCircle, Layers, Loader2 } from 'lucide-react';
 import KeyboardShortcuts from '@/react-app/components/KeyboardShortcuts';
@@ -88,6 +88,7 @@ export default function Home() {
     refreshAssets,
     addClip,
     updateClip,
+    updateClipTransition,
     deleteClip,
     undoWorkflowClips,
     moveClip,
@@ -234,12 +235,90 @@ export default function Home() {
       transform?: TimelineClip['transform'];
       captionWords?: Array<{ text: string; start: number; end: number }>;
       captionStyle?: CaptionStyle;
+      transitionType?: TransitionType;
+      transitionProgress?: number;
+      isOutgoingTransition?: boolean;
     }> = [];
 
     // Check video tracks (V1, V2, V3...)
     const videoTracks = ['V1', 'V2', 'V3'];
 
     for (const trackId of videoTracks) {
+      // For V1, handle transitions between adjacent clips
+      if (trackId === 'V1') {
+        const v1Clips = activeClips
+          .filter(c => c.trackId === 'V1')
+          .sort((a, b) => a.start - b.start);
+
+        // Find the current V1 clip (the one the playhead is on)
+        const currentV1Clip = v1Clips.find(c =>
+          currentTime >= c.start && currentTime < c.start + c.duration
+        );
+
+        if (currentV1Clip) {
+          const asset = assets.find(a => a.id === currentV1Clip.assetId);
+          const url = asset?.streamUrl || (asset ? getAssetStreamUrl(asset.id) : null);
+
+          if (asset && url) {
+            const clipTime = (currentTime - currentV1Clip.start) + (currentV1Clip.inPoint || 0);
+
+            // Check if we're in a transition zone (first `d` seconds of this clip)
+            const tr = currentV1Clip.transition;
+            const clipIdx = v1Clips.indexOf(currentV1Clip);
+            const prevClip = clipIdx > 0 ? v1Clips[clipIdx - 1] : null;
+
+            if (tr && tr.type !== 'none' && prevClip && currentTime < currentV1Clip.start + tr.duration) {
+              // We're in the transition zone — add outgoing (previous) clip first
+              const prevAsset = assets.find(a => a.id === prevClip.assetId);
+              const prevUrl = prevAsset?.streamUrl || (prevAsset ? getAssetStreamUrl(prevAsset.id) : null);
+              const progress = (currentTime - currentV1Clip.start) / tr.duration;
+
+              if (prevAsset && prevUrl) {
+                const prevClipTime = (currentTime - prevClip.start) + (prevClip.inPoint || 0);
+                layers.push({
+                  id: prevClip.id,
+                  url: prevUrl,
+                  type: prevAsset.type,
+                  trackId: 'V1',
+                  clipTime: prevClipTime,
+                  clipStart: prevClip.start,
+                  transform: prevClip.transform,
+                  transitionType: tr.type,
+                  transitionProgress: progress,
+                  isOutgoingTransition: true,
+                });
+              }
+
+              // Add incoming (current) clip with transition metadata
+              layers.push({
+                id: currentV1Clip.id,
+                url,
+                type: asset.type,
+                trackId: 'V1',
+                clipTime,
+                clipStart: currentV1Clip.start,
+                transform: currentV1Clip.transform,
+                transitionType: tr.type,
+                transitionProgress: progress,
+                isOutgoingTransition: false,
+              });
+            } else {
+              // Normal — no transition, just the current clip
+              layers.push({
+                id: currentV1Clip.id,
+                url,
+                type: asset.type,
+                trackId: 'V1',
+                clipTime,
+                clipStart: currentV1Clip.start,
+                transform: currentV1Clip.transform,
+              });
+            }
+          }
+        }
+        continue; // Skip the generic loop for V1
+      }
+
       const clipsOnTrack = activeClips.filter(c =>
         c.trackId === trackId &&
         currentTime >= c.start &&
@@ -694,6 +773,12 @@ export default function Home() {
     updateClip(clipId, { transform });
     saveProject();
   }, [updateClip, saveProject]);
+
+  // Handle updating clip transition
+  const handleUpdateClipTransition = useCallback((clipId: string, transition: TimelineClip['transition']) => {
+    updateClipTransition(clipId, transition);
+    saveProject();
+  }, [updateClipTransition, saveProject]);
 
   // Get selected clip and its asset
   const selectedClip = useMemo(() =>
@@ -2663,7 +2748,9 @@ export default function Home() {
                   <ClipPropertiesPanel
                     clip={selectedClip}
                     asset={selectedClipAsset}
+                    allClips={clips}
                     onUpdateTransform={handleUpdateClipTransform}
+                    onUpdateTransition={handleUpdateClipTransition}
                     onClose={() => setSelectedClipId(null)}
                   />
                 )}

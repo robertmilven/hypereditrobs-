@@ -1,6 +1,6 @@
-import { useCallback } from 'react';
-import { Move, RotateCw, Crop, X } from 'lucide-react';
-import type { TimelineClip, Asset } from '@/react-app/hooks/useProject';
+import { useCallback, useMemo } from 'react';
+import { Move, RotateCw, Crop, X, Sparkles } from 'lucide-react';
+import type { TimelineClip, Asset, TransitionType, ClipTransition } from '@/react-app/hooks/useProject';
 
 interface ClipTransform {
   x?: number;
@@ -14,19 +14,46 @@ interface ClipTransform {
   cropRight?: number;
 }
 
+const TRANSITION_OPTIONS: { type: TransitionType; label: string; icon: string }[] = [
+  { type: 'none', label: 'None', icon: '✕' },
+  { type: 'crossfade', label: 'Crossfade', icon: '◐' },
+  { type: 'wipe-left', label: 'Wipe Left', icon: '◀' },
+  { type: 'wipe-right', label: 'Wipe Right', icon: '▶' },
+  { type: 'wipe-up', label: 'Wipe Up', icon: '▲' },
+  { type: 'wipe-down', label: 'Wipe Down', icon: '▼' },
+  { type: 'slide-left', label: 'Slide L', icon: '⇐' },
+  { type: 'slide-right', label: 'Slide R', icon: '⇒' },
+  { type: 'zoom-in', label: 'Zoom In', icon: '⊕' },
+  { type: 'zoom-out', label: 'Zoom Out', icon: '⊖' },
+];
+
 interface ClipPropertiesPanelProps {
   clip: TimelineClip | null;
   asset: Asset | null;
+  allClips?: TimelineClip[]; // All clips to detect adjacent V1 clips
   onUpdateTransform: (clipId: string, transform: ClipTransform) => void;
+  onUpdateTransition?: (clipId: string, transition: ClipTransition | undefined) => void;
   onClose: () => void;
 }
 
 export default function ClipPropertiesPanel({
   clip,
   asset,
+  allClips = [],
   onUpdateTransform,
+  onUpdateTransition,
   onClose,
 }: ClipPropertiesPanelProps) {
+  // Check if this V1 clip has a preceding V1 clip (needed to show transition options)
+  const hasPrecedingV1Clip = useMemo(() => {
+    if (!clip || clip.trackId !== 'V1') return false;
+    const v1Clips = allClips
+      .filter(c => c.trackId === 'V1')
+      .sort((a, b) => a.start - b.start);
+    const idx = v1Clips.findIndex(c => c.id === clip.id);
+    return idx > 0;
+  }, [clip, allClips]);
+
   if (!clip || !asset) {
     return (
       <div className="p-3 text-center text-zinc-500 text-xs">
@@ -217,6 +244,71 @@ export default function ClipPropertiesPanel({
           </div>
         </div>
       </div>
+
+      {/* Transition section (V1 clips with a preceding clip) */}
+      {hasPrecedingV1Clip && onUpdateTransition && (
+        <div className="px-3 py-3 border-t border-zinc-800/50 space-y-3">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-3.5 h-3.5 text-orange-400" />
+            <span className="text-xs font-medium text-zinc-300">Transition</span>
+          </div>
+
+          {/* Type grid */}
+          <div className="grid grid-cols-5 gap-1">
+            {TRANSITION_OPTIONS.map(opt => {
+              const isActive = (clip.transition?.type || 'none') === opt.type;
+              return (
+                <button
+                  key={opt.type}
+                  onClick={() => {
+                    if (opt.type === 'none') {
+                      onUpdateTransition(clip.id, undefined);
+                    } else {
+                      onUpdateTransition(clip.id, {
+                        type: opt.type,
+                        duration: clip.transition?.duration ?? 0.5,
+                      });
+                    }
+                  }}
+                  className={`flex flex-col items-center gap-0.5 p-1.5 rounded text-center transition-colors ${
+                    isActive
+                      ? 'bg-orange-500/30 ring-1 ring-orange-400 text-orange-300'
+                      : 'bg-zinc-800 hover:bg-zinc-700 text-zinc-400'
+                  }`}
+                  title={opt.label}
+                >
+                  <span className="text-sm leading-none">{opt.icon}</span>
+                  <span className="text-[8px] leading-none truncate w-full">{opt.label}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Duration slider (only when a transition is active) */}
+          {clip.transition && clip.transition.type !== 'none' && (
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] text-zinc-500">Duration</span>
+                <span className="text-[10px] text-zinc-400">{clip.transition.duration.toFixed(1)}s</span>
+              </div>
+              <input
+                type="range"
+                min="0.1"
+                max="2.0"
+                step="0.1"
+                value={clip.transition.duration}
+                onChange={(e) => {
+                  onUpdateTransition(clip.id, {
+                    type: clip.transition!.type,
+                    duration: parseFloat(e.target.value),
+                  });
+                }}
+                className="w-full h-1.5 bg-zinc-700 rounded-lg appearance-none cursor-pointer accent-orange-500"
+              />
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Reset button */}
       <div className="p-3 border-t border-zinc-800/50">

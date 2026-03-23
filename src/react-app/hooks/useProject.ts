@@ -17,6 +17,14 @@ export interface Asset {
   aiGenerated?: boolean; // True if this is a Remotion-generated animation
 }
 
+// Transition types available between clips
+export type TransitionType = 'none' | 'crossfade' | 'wipe-left' | 'wipe-right' | 'wipe-up' | 'wipe-down' | 'slide-left' | 'slide-right' | 'zoom-in' | 'zoom-out';
+
+export interface ClipTransition {
+  type: TransitionType;
+  duration: number; // seconds (default 0.5, max half of shorter adjacent clip)
+}
+
 // TimelineClip - instance on timeline
 export interface TimelineClip {
   id: string;
@@ -26,6 +34,7 @@ export interface TimelineClip {
   duration: number;
   inPoint: number;
   outPoint: number;
+  transition?: ClipTransition; // Entry transition — how this clip transitions FROM the previous one
   transform?: {
     x?: number;
     y?: number;
@@ -510,6 +519,13 @@ export function useProject() {
       clipIds.forEach(id => delete next[id]);
       return next;
     });
+  }, []);
+
+  // Update clip transition
+  const updateClipTransition = useCallback((clipId: string, transition: ClipTransition | undefined): void => {
+    setClips(prev => prev.map(c =>
+      c.id === clipId ? { ...c, transition } : c
+    ));
   }, []);
 
   // Move clip
@@ -1089,6 +1105,7 @@ export function useProject() {
     // Clips
     addClip,
     updateClip,
+    updateClipTransition,
     deleteClip,
     undoWorkflowClips,
     moveClip,

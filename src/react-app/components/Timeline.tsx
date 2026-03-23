@@ -1,7 +1,21 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { ZoomIn, ZoomOut, Play, Pause, SkipBack, Scissors, Trash2, Type, RectangleHorizontal, RectangleVertical, Link, Unlink, ImageIcon } from 'lucide-react';
 import TimelineClip from './TimelineClip';
-import type { Track, TimelineClip as TimelineClipType, Asset, CaptionData, FrameTemplateOverlay } from '@/react-app/hooks/useProject';
+import type { Track, TimelineClip as TimelineClipType, Asset, CaptionData, FrameTemplateOverlay, TransitionType } from '@/react-app/hooks/useProject';
+
+// Transition type display labels
+const TRANSITION_LABELS: Record<TransitionType, string> = {
+  'none': '',
+  'crossfade': 'CF',
+  'wipe-left': 'WL',
+  'wipe-right': 'WR',
+  'wipe-up': 'WU',
+  'wipe-down': 'WD',
+  'slide-left': 'SL',
+  'slide-right': 'SR',
+  'zoom-in': 'ZI',
+  'zoom-out': 'ZO',
+};
 
 interface TimelineProps {
   tracks: Track[];
@@ -601,6 +615,40 @@ export default function Timeline({
                         />
                       );
                     })}
+
+                    {/* Transition indicators between V1 clips */}
+                    {track.id === 'V1' && (() => {
+                      const sorted = [...trackClips].sort((a, b) => a.start - b.start);
+                      return sorted.map((clip) => {
+                        if (!clip.transition || clip.transition.type === 'none') return null;
+                        const label = TRANSITION_LABELS[clip.transition.type] || '?';
+                        const xPos = clip.start * pixelsPerSecond;
+                        return (
+                          <div
+                            key={`tr-${clip.id}`}
+                            className="absolute z-20 flex items-center justify-center cursor-pointer group"
+                            style={{
+                              left: `${xPos - 12}px`,
+                              top: '50%',
+                              transform: 'translateY(-50%)',
+                              width: 24,
+                              height: 24,
+                            }}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectClip(clip.id);
+                            }}
+                            title={`Transition: ${clip.transition.type} (${clip.transition.duration}s)`}
+                          >
+                            {/* Diamond shape */}
+                            <div className="w-5 h-5 bg-orange-500 rotate-45 rounded-sm shadow-lg shadow-orange-500/40 group-hover:bg-orange-400 transition-colors" />
+                            <span className="absolute text-[7px] font-bold text-white pointer-events-none select-none">
+                              {label}
+                            </span>
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
                 );
               })}

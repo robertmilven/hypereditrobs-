@@ -2339,20 +2339,150 @@ async function handleProjectRender(req, res, sessionId) {
       }
     }
 
-    // Process video clips
+    // Map transition types to FFmpeg xfade transition names
+    const XFADE_MAP = {
+      'crossfade': 'fade',
+      'wipe-left': 'wipeleft',
+      'wipe-right': 'wiperight',
+      'wipe-up': 'wipeup',
+      'wipe-down': 'wipedown',
+      'slide-left': 'slideleft',
+      'slide-right': 'slideright',
+      'zoom-in': 'circlecrop',
+      'zoom-out': 'fadeblack',
+    };
+
+    // Separate V1 clips from overlay clips (V2, V3)
+    const v1Clips = videoClips.filter(c => c.trackId === 'V1').sort((a, b) => a.start - b.start);
+    const overlayVideoClips = videoClips.filter(c => c.trackId !== 'V1');
+    const hasAnyTransitions = v1Clips.some(c => c.transition && c.transition.type && c.transition.type !== 'none');
+
+    // Process V1 clips
     const videoInputIndices = []; // track idx + asset for audio mixing later
-    for (const clip of videoClips) {
+
+    if (hasAnyTransitions && v1Clips.length >= 2) {
+      // === TRANSITION PATH: Pre-compose V1 clips using xfade ===
+      console.log(`[${sessionId}] Using xfade transition path for ${v1Clips.length} V1 clips`);
+
+      const v1Labels = [];
+      const v1Durations = [];
+
+      // Step 1: Add inputs and build trimmed/scaled streams for each V1 clip
+      for (let i = 0; i < v1Clips.length; i++) {
+        const clip = v1Clips[i];
+        const asset = session.assets.get(clip.assetId);
+        if (!asset) continue;
+
+        if (asset.type === 'image') {
+          const isGif = /\.gif$/i.test(asset.path);
+          if (isGif) {
+            inputs.push('-ignore_loop', '0');
+          } else {
+            inputs.push('-loop', '1');
+          }
+        }
+        inputs.push('-i', asset.path);
+        const idx = inputIndex++;
+        videoInputIndices.push({ clip, asset, idx });
+
+        const inPoint = clip.inPoint || 0;
+        const outPoint = clip.outPoint || clip.duration || asset.duration;
+        const trimDuration = outPoint - inPoint;
+
+        // Trim and scale WITHOUT PTS timeline shift (xfade handles timing internally)
+        let clipFilter = `[${idx}:v]trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS,`;
+        clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
+        clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
+        clipFilter += `[v1_${i}]`;
+        filterParts.push(clipFilter);
+
+        v1Labels.push(`v1_${i}`);
+        v1Durations.push(trimDuration);
+      }
+
+      // Step 2: Chain V1 clips using xfade (transitions) or concat (hard cuts)
+      let composedLabel = v1Labels[0];
+      let composedDuration = v1Durations[0];
+
+      for (let i = 1; i < v1Clips.length; i++) {
+        if (!v1Labels[i]) continue; // Skip if asset was missing
+        const clip = v1Clips[i];
+        const tr = clip.transition;
+        const clipDuration = v1Durations[i];
+
+        if (tr && tr.type !== 'none' && XFADE_MAP[tr.type]) {
+          // xfade transition between clips
+          const xfadeType = XFADE_MAP[tr.type];
+          const trDur = Math.min(tr.duration, composedDuration * 0.4, clipDuration * 0.4); // Safety clamp
+          const offset = Math.max(0, composedDuration - trDur);
+
+          console.log(`[${sessionId}] xfade: ${composedLabel} -> ${v1Labels[i]}, type=${xfadeType}, duration=${trDur}s, offset=${offset}s`);
+          filterParts.push(`[${composedLabel}][${v1Labels[i]}]xfade=transition=${xfadeType}:duration=${trDur}:offset=${offset}[xf${i}]`);
+          composedLabel = `xf${i}`;
+          composedDuration = composedDuration + clipDuration - trDur;
+        } else {
+          // Hard cut — use concat
+          filterParts.push(`[${composedLabel}][${v1Labels[i]}]concat=n=2:v=1:a=0[cc${i}]`);
+          composedLabel = `cc${i}`;
+          composedDuration += clipDuration;
+        }
+      }
+
+      // Step 3: Shift PTS to align composed V1 with timeline position and overlay onto base
+      const firstStart = v1Clips[0].start;
+      if (firstStart > 0) {
+        filterParts.push(`[${composedLabel}]setpts=PTS+(${firstStart}/TB)[v1composed]`);
+        composedLabel = 'v1composed';
+      }
+      const v1Enable = `between(t,${firstStart},${firstStart + composedDuration})`;
+      filterParts.push(`[${lastVideo}][${composedLabel}]overlay=x=(W-w)/2:y=(H-h)/2:enable='${v1Enable}'[v1out]`);
+      lastVideo = 'v1out';
+
+    } else {
+      // === STANDARD PATH: No transitions — overlay V1 clips individually ===
+      for (const clip of v1Clips) {
+        const asset = session.assets.get(clip.assetId);
+        if (!asset) continue;
+
+        if (asset.type === 'image') {
+          const isGif = /\.gif$/i.test(asset.path);
+          if (isGif) {
+            inputs.push('-ignore_loop', '0');
+          } else {
+            inputs.push('-loop', '1');
+          }
+        }
+        inputs.push('-i', asset.path);
+        const idx = inputIndex++;
+        videoInputIndices.push({ clip, asset, idx });
+
+        const inPoint = clip.inPoint || 0;
+        const outPoint = clip.outPoint || clip.duration || asset.duration;
+        const trimDuration = outPoint - inPoint;
+
+        let clipFilter = `[${idx}:v]`;
+        clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS+(${clip.start}/TB),`;
+        clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
+        clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
+        clipFilter += `[v${idx}]`;
+        filterParts.push(clipFilter);
+
+        const enable = `between(t,${clip.start},${clip.start + trimDuration})`;
+        filterParts.push(`[${lastVideo}][v${idx}]overlay=x=(W-w)/2:y=(H-h)/2:enable='${enable}'[out${idx}]`);
+        lastVideo = `out${idx}`;
+      }
+    }
+
+    // Process overlay video clips (V2, V3)
+    for (const clip of overlayVideoClips) {
       const asset = session.assets.get(clip.assetId);
       if (!asset) continue;
 
-      // Images and GIFs need special input flags so they produce frames for the full clip duration
       if (asset.type === 'image') {
         const isGif = /\.gif$/i.test(asset.path);
         if (isGif) {
-          // ignore_loop 0 makes the GIF loop indefinitely instead of playing once
           inputs.push('-ignore_loop', '0');
         } else {
-          // loop 1 makes the static image repeat indefinitely
           inputs.push('-loop', '1');
         }
       }
@@ -2360,75 +2490,38 @@ async function handleProjectRender(req, res, sessionId) {
       const idx = inputIndex++;
       videoInputIndices.push({ clip, asset, idx });
 
-      // Apply trim and scale
       const inPoint = clip.inPoint || 0;
-      // For images, asset.duration is 0 — use clip.duration as the out point
       const outPoint = clip.outPoint || clip.duration || asset.duration;
       const trimDuration = outPoint - inPoint;
 
       let clipFilter = `[${idx}:v]`;
-
-      // Trim and shift PTS so overlay frames align with their position on the output timeline.
-      // Without the +(clip.start/TB) shift, frames start at PTS=0 but the overlay is enabled
-      // at t=clip.start, causing FFmpeg to look for frames that don't exist yet.
       clipFilter += `trim=${inPoint}:${outPoint},setpts=PTS-STARTPTS+(${clip.start}/TB),`;
 
-      // Check if this is an overlay track (V2, V3, etc.)
-      const isOverlayTrack = clip.trackId && clip.trackId !== 'V1';
-
-      if (isOverlayTrack) {
-        // V2/V3 overlay clips - scale to a percentage of canvas, don't fill frame
-        const transformScale = clip.transform?.scale ?? 0.2; // Default 20% of canvas width
-        const targetWidth = Math.round(settings.width * transformScale);
-        clipFilter += `scale=${targetWidth}:-1`;
-        console.log(`[${sessionId}] Overlay ${clip.trackId}: scale=${transformScale}, targetWidth=${targetWidth}`);
-      } else {
-        // V1 main video - scale/fit to canvas and center
-        clipFilter += `scale=${settings.width}:${settings.height}:force_original_aspect_ratio=decrease,`;
-        clipFilter += `pad=${settings.width}:${settings.height}:(ow-iw)/2:(oh-ih)/2`;
-      }
+      const transformScale = clip.transform?.scale ?? 0.2;
+      const targetWidth = Math.round(settings.width * transformScale);
+      clipFilter += `scale=${targetWidth}:-1`;
+      console.log(`[${sessionId}] Overlay ${clip.trackId}: scale=${transformScale}, targetWidth=${targetWidth}`);
 
       clipFilter += `[v${idx}]`;
       filterParts.push(clipFilter);
 
-      // Overlay onto base - calculate position
-      let overlayX, overlayY;
-      if (isOverlayTrack) {
-        // Get x,y offsets (these are preview pixel values)
-        const xOffset = clip.transform?.x ?? 0;
-        const yOffset = clip.transform?.y ?? 0;
+      const xOffset = clip.transform?.x ?? 0;
+      const yOffset = clip.transform?.y ?? 0;
+      const isVertical = settings.height > settings.width;
+      const previewWidth = isVertical ? 400 : 900;
+      const previewHeight = isVertical ? 711 : 506;
+      const scaleFactorX = settings.width / previewWidth;
+      const scaleFactorY = settings.height / previewHeight;
+      const scaledXOffset = Math.round(xOffset * scaleFactorX);
+      const scaledYOffset = Math.round(yOffset * scaleFactorY);
 
-        // The preview size varies by viewport and aspect ratio
-        // 16:9 horizontal: typically ~900px wide (max-w-4xl is ~896px)
-        // 9:16 vertical: typically ~400px wide (h-65vh with 9:16 aspect)
-        const isVertical = settings.height > settings.width;
-        const previewWidth = isVertical ? 400 : 900;
-        const previewHeight = isVertical ? 711 : 506;
+      const overlayX = `(W-w)/2+${scaledXOffset}`;
+      const overlayY = `H*0.85-h/2+${scaledYOffset}`;
 
-        // Scale factor: convert preview pixels to export pixels
-        const scaleFactorX = settings.width / previewWidth;
-        const scaleFactorY = settings.height / previewHeight;
+      console.log(`[${sessionId}] Overlay ${clip.trackId} position: xOffset=${xOffset}, yOffset=${yOffset}, preview=${previewWidth}x${previewHeight}`);
+      console.log(`[${sessionId}]   -> scaled=(${scaledXOffset}, ${scaledYOffset}), FFmpeg: x=${overlayX}, y=${overlayY}`);
 
-        const scaledXOffset = Math.round(xOffset * scaleFactorX);
-        const scaledYOffset = Math.round(yOffset * scaleFactorY);
-
-        // Position the overlay:
-        // - Base X position is center of frame horizontally
-        // - Base Y position is 70% down (matching preview default of top:70%)
-        // - Apply the user's x,y offsets (scaled to export resolution)
-        overlayX = `(W-w)/2+${scaledXOffset}`;
-        // Use H*0.85 as base Y (85% down from top), then center overlay and add offset
-        overlayY = `H*0.85-h/2+${scaledYOffset}`;
-
-        console.log(`[${sessionId}] Overlay ${clip.trackId} position: xOffset=${xOffset}, yOffset=${yOffset}, preview=${previewWidth}x${previewHeight}`);
-        console.log(`[${sessionId}]   -> scaled=(${scaledXOffset}, ${scaledYOffset}), FFmpeg: x=${overlayX}, y=${overlayY}`);
-      } else {
-        // V1 - center the clip
-        overlayX = `(W-w)/2`;
-        overlayY = `(H-h)/2`;
-      }
       const enable = `between(t,${clip.start},${clip.start + trimDuration})`;
-
       filterParts.push(`[${lastVideo}][v${idx}]overlay=x=${overlayX}:y=${overlayY}:enable='${enable}'[out${idx}]`);
       lastVideo = `out${idx}`;
     }

@@ -1,7 +1,7 @@
 import { Play, Image as ImageIcon, Layers, Move } from 'lucide-react';
 import { useRef, useEffect, forwardRef, useImperativeHandle, useMemo, useState, useCallback } from 'react';
 import CaptionRenderer from './CaptionRenderer';
-import type { CaptionWord, CaptionStyle, FrameTemplate, Asset } from '@/react-app/hooks/useProject';
+import type { CaptionWord, CaptionStyle, FrameTemplate, Asset, TransitionType } from '@/react-app/hooks/useProject';
 import type { OverlayAsset } from '@/react-app/hooks/useOverlayAssets';
 
 interface ClipTransform {
@@ -26,6 +26,10 @@ interface ClipLayer {
   // Caption-specific data
   captionWords?: CaptionWord[];
   captionStyle?: CaptionStyle;
+  // Transition data
+  transitionType?: TransitionType;
+  transitionProgress?: number; // 0-1
+  isOutgoingTransition?: boolean; // true = this is the outgoing (old) clip
 }
 
 interface VideoPreviewProps {
@@ -108,6 +112,55 @@ function getFrameBackgroundStyle(template: FrameTemplate, baseVideoUrl?: string)
   }
 }
 
+// Compute CSS styles for transition effects
+function getTransitionCSS(
+  type: TransitionType | undefined,
+  progress: number,
+  isOutgoing: boolean
+): React.CSSProperties {
+  if (!type || type === 'none') return {};
+  const p = Math.max(0, Math.min(1, progress));
+
+  switch (type) {
+    case 'crossfade':
+      return { opacity: isOutgoing ? 1 - p : p };
+    case 'wipe-left':
+      return isOutgoing
+        ? { clipPath: `inset(0 ${p * 100}% 0 0)` }
+        : {};
+    case 'wipe-right':
+      return isOutgoing
+        ? { clipPath: `inset(0 0 0 ${p * 100}%)` }
+        : {};
+    case 'wipe-up':
+      return isOutgoing
+        ? { clipPath: `inset(${p * 100}% 0 0 0)` }
+        : {};
+    case 'wipe-down':
+      return isOutgoing
+        ? { clipPath: `inset(0 0 ${p * 100}% 0)` }
+        : {};
+    case 'slide-left':
+      return isOutgoing
+        ? { transform: `translateX(${-p * 100}%)` }
+        : { transform: `translateX(${(1 - p) * 100}%)` };
+    case 'slide-right':
+      return isOutgoing
+        ? { transform: `translateX(${p * 100}%)` }
+        : { transform: `translateX(${-(1 - p) * 100}%)` };
+    case 'zoom-in':
+      return isOutgoing
+        ? { opacity: 1 - p }
+        : { transform: `scale(${0.5 + p * 0.5})`, opacity: p };
+    case 'zoom-out':
+      return isOutgoing
+        ? { transform: `scale(${1 - p * 0.5})`, opacity: 1 - p }
+        : { opacity: p };
+    default:
+      return {};
+  }
+}
+
 const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   layers = [],
   isPlaying = false,
@@ -122,14 +175,22 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   overlayAssets = [], // Received from parent - shared state
 }, ref) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const transitionVideoRef = useRef<HTMLVideoElement>(null); // For outgoing clip during transitions
   const loadedSrcRef = useRef<string | null>(null);
+  const transitionLoadedSrcRef = useRef<string | null>(null);
   const overlayVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const containerRef = useRef<HTMLDivElement>(null);
   const [draggingLayer, setDraggingLayer] = useState<string | null>(null);
   const [dragStart, setDragStart] = useState<{ x: number; y: number; layerX: number; layerY: number } | null>(null);
 
-  // Find the base video layer (V1) for audio/playback control
-  const foundBaseLayer = layers.find(l => l.trackId === 'V1' && l.type === 'video');
+  // Find V1 video layers — during transitions there may be two (outgoing + incoming)
+  const v1Layers = layers.filter(l => l.trackId === 'V1' && (l.type === 'video' || l.type === 'image'));
+  const incomingV1 = v1Layers.find(l => !l.isOutgoingTransition);
+  const outgoingV1 = v1Layers.find(l => l.isOutgoingTransition);
+  const isInTransition = !!(outgoingV1 && incomingV1 && incomingV1.transitionType);
+
+  // The "base" layer is the incoming (or only) V1 layer
+  const foundBaseLayer = incomingV1;
   const baseLayerId = foundBaseLayer?.id;
   const baseLayerUrl = foundBaseLayer?.url;
   const baseLayerClipTime = foundBaseLayer?.clipTime;
@@ -237,6 +298,51 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
       }
     });
   }, [isPlaying]);
+
+  // Manage outgoing transition video element
+  useEffect(() => {
+    const video = transitionVideoRef.current;
+    if (!video || !outgoingV1) return;
+
+    const url = outgoingV1.url;
+    if (transitionLoadedSrcRef.current !== url) {
+      video.src = url;
+      video.load();
+      transitionLoadedSrcRef.current = url;
+      video.addEventListener('loadeddata', () => {
+        if (outgoingV1.clipTime !== undefined) {
+          video.currentTime = outgoingV1.clipTime;
+        }
+        if (isPlaying) {
+          video.play().catch(() => {});
+        }
+      }, { once: true });
+    } else if (outgoingV1.clipTime !== undefined) {
+      // Seek when scrubbing
+      if (!isPlaying && Math.abs(video.currentTime - outgoingV1.clipTime) > 0.1) {
+        video.currentTime = outgoingV1.clipTime;
+      }
+    }
+  }, [outgoingV1, isPlaying]);
+
+  // Play/pause the transition video
+  useEffect(() => {
+    const video = transitionVideoRef.current;
+    if (!video) return;
+    if (isPlaying && outgoingV1) {
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
+  }, [isPlaying, outgoingV1]);
+
+  // Clear transition video when not in transition
+  useEffect(() => {
+    if (!outgoingV1 && transitionVideoRef.current) {
+      transitionVideoRef.current.pause();
+      transitionLoadedSrcRef.current = null;
+    }
+  }, [outgoingV1]);
 
   // Sync overlay video and audio seeking when scrubbing
   useEffect(() => {
@@ -354,8 +460,9 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
   }
 
   // Separate base video from overlay layers to prevent re-render issues
+  // Filter out ALL V1 video/image layers (both incoming and outgoing transition)
   const overlayLayers = useMemo(() =>
-    sortedLayers.filter(l => !(l.trackId === 'V1' && l.type === 'video')),
+    sortedLayers.filter(l => !(l.trackId === 'V1' && (l.type === 'video' || l.type === 'image'))),
     [sortedLayers]
   );
 
@@ -421,18 +528,65 @@ const VideoPreview = forwardRef<VideoPreviewHandle, VideoPreviewProps>(({
         </>
       )}
 
-      {/* Base video layer (V1) - rendered separately for stability */}
-      {foundBaseLayer && (
+      {/* Outgoing transition layer (V1) — only visible during transitions */}
+      {outgoingV1 && outgoingV1.type === 'video' && (
+        <video
+          key="transition-video"
+          ref={transitionVideoRef}
+          className={`absolute inset-0 w-full h-full ${videoFitClass}`}
+          style={{
+            zIndex: 2,
+            ...getTransitionCSS(outgoingV1.transitionType, outgoingV1.transitionProgress ?? 0, true),
+          }}
+          playsInline
+          preload="auto"
+          muted
+        />
+      )}
+      {outgoingV1 && outgoingV1.type === 'image' && (
+        <div
+          key="transition-image"
+          className="absolute inset-0 w-full h-full"
+          style={{
+            zIndex: 2,
+            ...getTransitionCSS(outgoingV1.transitionType, outgoingV1.transitionProgress ?? 0, true),
+          }}
+        >
+          <img src={outgoingV1.url} alt="" className="w-full h-full object-contain" draggable={false} />
+        </div>
+      )}
+
+      {/* Base video layer (V1) — incoming or only clip */}
+      {foundBaseLayer && foundBaseLayer.type === 'video' && (
         <video
           key="base-video"
           ref={videoRef}
           src={foundBaseLayer.url}
           className={`absolute inset-0 w-full h-full ${videoFitClass}`}
-          style={{ zIndex: 1 }}
+          style={{
+            zIndex: 1,
+            ...(isInTransition && incomingV1
+              ? getTransitionCSS(incomingV1.transitionType, incomingV1.transitionProgress ?? 0, false)
+              : {}),
+          }}
           playsInline
           preload="auto"
           onLoadedData={handleLoaded}
         />
+      )}
+      {foundBaseLayer && foundBaseLayer.type === 'image' && (
+        <div
+          key="base-image"
+          className="absolute inset-0 w-full h-full"
+          style={{
+            zIndex: 1,
+            ...(isInTransition && incomingV1
+              ? getTransitionCSS(incomingV1.transitionType, incomingV1.transitionProgress ?? 0, false)
+              : {}),
+          }}
+        >
+          <img src={foundBaseLayer.url} alt="" className="w-full h-full object-contain" draggable={false} />
+        </div>
       )}
 
       {/* Render overlay layers (V2+, images, captions) */}
