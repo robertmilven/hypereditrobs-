@@ -73,7 +73,7 @@ export interface CaptionStyle {
   strokeColor?: string;
   strokeWidth?: number;
   position: 'bottom' | 'center' | 'top';
-  animation: 'none' | 'karaoke' | 'fade' | 'pop' | 'bounce' | 'typewriter';
+  animation: 'none' | 'karaoke' | 'fade' | 'pop' | 'bounce' | 'typewriter' | 'highlight' | 'bold-center' | 'minimal';
   highlightColor?: string;
   timeOffset?: number; // Offset in seconds to adjust sync (negative = earlier, positive = later)
 }

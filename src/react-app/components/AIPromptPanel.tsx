@@ -84,6 +84,9 @@ interface ChatMessage {
     explanation: string;
     applied?: boolean;
   };
+  // For FrameForge template saving
+  saveTemplateData?: { style: string; content: string };
+  templateSaved?: boolean;
 }
 
 interface CaptionOptions {
@@ -382,7 +385,26 @@ export default function AIPromptPanel({
   const [processingStatus, setProcessingStatus] = useState('');
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [showCaptionOptions, setShowCaptionOptions] = useState(false);
+  const [showStylePicker, setShowStylePicker] = useState(false);
   const [showQuickActions, setShowQuickActions] = useState(false);
+
+  // FrameForge saved templates
+  const [savedTemplates, setSavedTemplates] = useState<Array<{ name: string; style: string; content: string }>>(() => {
+    try {
+      const saved = localStorage.getItem('frameforge-templates');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
+  const saveTemplate = (name: string, style: string, content: string) => {
+    const updated = [...savedTemplates, { name, style, content }];
+    setSavedTemplates(updated);
+    localStorage.setItem('frameforge-templates', JSON.stringify(updated));
+  };
+  const deleteTemplate = (index: number) => {
+    const updated = savedTemplates.filter((_, i) => i !== index);
+    setSavedTemplates(updated);
+    localStorage.setItem('frameforge-templates', JSON.stringify(updated));
+  };
   const [showReferencePicker, setShowReferencePicker] = useState(false);
   const [selectedReferences, setSelectedReferences] = useState<TimelineReference[]>([]);
   const [showTimeRangePicker, setShowTimeRangePicker] = useState(false);
@@ -823,6 +845,17 @@ export default function AIPromptPanel({
 
   const RECIPES: Recipe[] = [
     {
+      id: 'full-enhance',
+      label: '🎨 Full Enhance (FrameForge)',
+      description: 'Remove silence → captions → 5 FrameForge animations → chapters',
+      steps: [
+        { workflowType: 'dead-air',         label: 'Removing dead air...' },
+        { workflowType: 'captions',         label: 'Adding captions...' },
+        { workflowType: 'batch-animations', label: 'Adding 5 FrameForge animations...', count: 5 },
+        { workflowType: 'chapter-cuts',     label: 'Cutting at chapters...' },
+      ],
+    },
+    {
       id: 'youtube-ready',
       label: 'YouTube-Ready',
       description: 'Remove silence → captions → chapters → 5 animations',
@@ -960,7 +993,22 @@ export default function AIPromptPanel({
       ],
     },
     {
-      label: 'New Features',
+      label: '🎨 FrameForge Animations',
+      items: [
+        { icon: Sparkles, text: 'Full edit (captions + animations + chapters)' },
+        { icon: Wand2, text: 'Auto enhance' },
+        { icon: Film, text: 'Add 5 animations' },
+        { icon: Sparkles, text: 'Neon glow about my intro' },
+        { icon: Sparkles, text: 'Glassmorphism about key features' },
+        { icon: Sparkles, text: 'Bold typography about the main point' },
+        { icon: Sparkles, text: 'Data dashboard about the stats' },
+        { icon: Sparkles, text: 'Particle burst about the reveal' },
+        { icon: Sparkles, text: 'Cinematic bars about the conclusion' },
+        { icon: Sparkles, text: 'Floating bubbles about the ideas' },
+      ],
+    },
+    {
+      label: 'Smart Tools',
       items: [
         { icon: Camera, text: 'Auto-reframe to center subject' },
         { icon: Film, text: 'Create highlight reel (60s)' },
@@ -1375,6 +1423,8 @@ export default function AIPromptPanel({
     | 'generate-thumbnail' // Extract best frame as image asset
     | 'color-grade'        // Apply color grade preset via FFmpeg
     | 'ffmpeg-edit'         // Direct FFmpeg video manipulation
+    | 'auto-enhance'       // FrameForge transcript intelligence + overlay suggestions
+    | 'frameforge-style'   // Direct FrameForge animation with specific style + timestamp
     | 'unknown';            // Need to ask for clarification
 
   interface DirectorContext {
@@ -1529,6 +1579,35 @@ export default function AIPromptPanel({
         (lower.includes('remove') && (lower.includes('filler') || lower.includes('ums') || lower.includes('uhs'))) ||
         lower.includes('caption cleanup') || lower.includes('caption clean')) {
       return 'caption-polish';
+    }
+
+    // FrameForge style-specific animation (e.g. "at 2:33 add neon glow about AI")
+    const ffStyleNames = ['neon glow','glassmorphism','bold typography','data dashboard','split reveal',
+      'particle burst','kinetic stack','spotlight','gradient wave','card flip','typewriter','terminal',
+      'retro vhs','minimalist','line art','magazine','isometric','progress journey','quote showcase',
+      'comparison split','emoji explosion','blueprint','countdown','stacked bars','floating bubbles',
+      'cinematic bars','morphing shapes','newspaper','headline','reveal wipe','orbit','watercolor'];
+    if (ffStyleNames.some(s => lower.includes(s))) {
+      return 'frameforge-style';
+    }
+
+    // One-click full enhance — auto captions + animations + intro + outro
+    if (lower.includes('full enhance') || lower.includes('one click') || lower.includes('enhance everything') ||
+        lower.includes('do everything') || lower.includes('full edit') || lower.includes('auto edit')) {
+      return 'captions'; // Start with captions, then chain the rest via recipe
+    }
+
+    // Apply enhancements — trigger batch animations from auto-enhance results
+    if (lower.includes('apply enhance') || lower.includes('apply overlay')) {
+      return 'batch-animations';
+    }
+
+    // Auto-enhance — FrameForge transcript intelligence
+    if (lower.includes('auto enhance') || lower.includes('auto-enhance') ||
+        lower.includes('enhance video') || lower.includes('smart overlay') ||
+        lower.includes('suggest overlay') || lower.includes('auto overlay') ||
+        lower.includes('frameforge')) {
+      return 'auto-enhance';
     }
 
     // Caption-related requests
@@ -3428,6 +3507,199 @@ export default function AIPromptPanel({
       return;
     }
 
+    // Auto-enhance (FrameForge transcript intelligence)
+    // FrameForge style-specific animation
+    if (workflow === 'frameforge-style') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, { type: 'assistant', text: 'Please upload a video first.' }]);
+        return;
+      }
+
+      setIsProcessing(true);
+
+      try {
+        // Parse timestamp from prompt (e.g. "at 2:33" or "at 45s" or "at 1:20:05")
+        const timeMatch = prompt.match(/(?:at\s+)?(\d+):(\d+)(?::(\d+))?/);
+        const secMatch = prompt.match(/(?:at\s+)?(\d+)\s*s\b/);
+        let startTime = currentTime || 0; // default to current playhead
+        if (timeMatch) {
+          if (timeMatch[3]) {
+            startTime = parseInt(timeMatch[1]) * 3600 + parseInt(timeMatch[2]) * 60 + parseInt(timeMatch[3]);
+          } else {
+            startTime = parseInt(timeMatch[1]) * 60 + parseInt(timeMatch[2]);
+          }
+        } else if (secMatch) {
+          startTime = parseInt(secMatch[1]);
+        }
+
+        // Find which style was mentioned
+        const styleNames: Record<string, string> = {
+          'neon glow': 'Neon Glow', 'glassmorphism': 'Glassmorphism', 'bold typography': 'Bold Typography',
+          'data dashboard': 'Data Dashboard', 'split reveal': 'Split Reveal', 'particle burst': 'Particle Burst',
+          'kinetic stack': 'Kinetic Stack', 'spotlight': 'Spotlight Focus', 'gradient wave': 'Gradient Wave',
+          'card flip': 'Card Flip', 'typewriter': 'Typewriter Terminal', 'terminal': 'Typewriter Terminal',
+          'retro vhs': 'Retro VHS', 'minimalist': 'Minimalist Line Art', 'line art': 'Minimalist Line Art',
+          'magazine': 'Magazine Layout', 'isometric': 'Isometric Icons', 'progress journey': 'Progress Journey',
+          'quote showcase': 'Quote Showcase', 'comparison split': 'Comparison Split',
+          'emoji explosion': 'Emoji Explosion', 'blueprint': 'Blueprint Grid', 'countdown': 'Countdown Timer',
+          'stacked bars': 'Stacked Bars', 'floating bubbles': 'Floating Bubbles',
+          'cinematic bars': 'Cinematic Bars', 'morphing shapes': 'Morphing Shapes',
+          'newspaper': 'Newspaper Headline', 'headline': 'Newspaper Headline', 'reveal wipe': 'Reveal Wipe',
+          'orbit': 'Orbit System', 'watercolor': 'Watercolor Splash',
+        };
+        const lower = prompt.toLowerCase();
+        let matchedStyle = 'Neon Glow';
+        for (const [key, value] of Object.entries(styleNames)) {
+          if (lower.includes(key)) { matchedStyle = value; break; }
+        }
+
+        // Extract the "about" content - everything after style name or "about"/"saying"/"with"
+        let content = matchedStyle;
+        const aboutMatch = prompt.match(/(?:about|saying|with|for)\s+(.+?)(?:\s+at\s+\d|$)/i);
+        if (aboutMatch) {
+          content = aboutMatch[1].trim();
+        } else {
+          // Remove style name and timestamp from prompt to get content
+          let remaining = prompt;
+          for (const key of Object.keys(styleNames)) {
+            remaining = remaining.replace(new RegExp(key, 'gi'), '');
+          }
+          remaining = remaining.replace(/at\s+\d+[:\d]*\s*/g, '').replace(/add\s*/gi, '').trim();
+          if (remaining.length > 3) content = remaining;
+        }
+
+        const timeStr = `${Math.floor(startTime / 60)}:${String(Math.floor(startTime % 60)).padStart(2, '0')}`;
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: `🎨 Generating **${matchedStyle}** animation at ${timeStr}...\n\nContent: "${content}"\n\nRendering with FrameForge...`,
+          isProcessingGifs: true,
+        }]);
+
+        // Use onCreateCustomAnimation which handles the server call
+        const description = `FRAMEFORGE STYLE: ${matchedStyle}. Create a ${matchedStyle} style animation. Content: "${content}". Use the ${matchedStyle} visual aesthetic with smooth animations. Make it visually striking and professional.`;
+        const result = await onCreateCustomAnimation?.(description, startTime, startTime + 5);
+
+        if (result) {
+          const savedContent = content;
+          const savedStyle = matchedStyle;
+          setChatHistory(prev => {
+            const updated = [...prev];
+            const lastIdx = updated.length - 1;
+            if (updated[lastIdx]?.isProcessingGifs) {
+              updated[lastIdx] = {
+                ...updated[lastIdx],
+                text: `✅ **${matchedStyle}** animation added at ${timeStr}!\n\nDuration: ${result.duration}s\n\nClick "Save as Template" to reuse this style.`,
+                isProcessingGifs: false,
+                applied: true,
+                saveTemplateData: { style: savedStyle, content: savedContent },
+              };
+            }
+            return updated;
+          });
+        }
+      } catch (error) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: `Failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        }]);
+      }
+      setIsProcessing(false);
+      return;
+    }
+
+    if (workflow === 'auto-enhance') {
+      if (!hasVideo) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: 'Please upload a video first. I\'ll analyse the transcript and suggest smart overlays.',
+        }]);
+        return;
+      }
+
+      setChatHistory(prev => [...prev, {
+        type: 'assistant',
+        text: '🔍 **Auto Enhance** — Analysing your video transcript for key moments, stats, emphasis points, and narrative structure...',
+      }]);
+      setIsProcessing(true);
+
+      try {
+        // Get caption words from existing captions on T1
+        const captionClips = clips.filter((c: { trackId: string }) => c.trackId === 'T1');
+        let allWords: Array<{ text: string; start: number; end: number }> = [];
+        for (const clip of captionClips) {
+          const cd = captionData[clip.id];
+          if (cd?.words?.length) {
+            allWords = allWords.concat(cd.words.map((w: { text: string; start: number; end: number }) => ({
+              text: w.text,
+              start: w.start + clip.start,
+              end: w.end + clip.start,
+            })));
+          }
+        }
+
+        if (allWords.length === 0) {
+          setChatHistory(prev => [...prev, {
+            type: 'assistant',
+            text: 'No captions found. Please add captions first (transcribe your video), then try auto-enhance again. I need the word timestamps to analyse your content.',
+          }]);
+          setIsProcessing(false);
+          return;
+        }
+
+        // Get video duration
+        const lastWord = allWords[allWords.length - 1];
+        const duration = lastWord.end + 1;
+
+        const response = await fetch('http://localhost:3333/auto-enhance', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ words: allWords, duration }),
+        });
+
+        if (!response.ok) throw new Error('Auto-enhance request failed');
+        const data = await response.json();
+
+        // Build a readable summary
+        const intel = data.intelligence;
+        const suggestions = data.suggestions || [];
+        let summary = '✅ **Auto Enhance Complete**\n\n';
+        summary += `**Transcript Analysis:**\n`;
+        summary += `• ${intel.speechStats.totalWords} words, ${intel.speechStats.avgWordsPerSecond} words/sec average\n`;
+        summary += `• ${intel.pauses.length} pauses detected (${intel.pauses.filter((p: { type: string }) => p.type === 'transition').length} topic transitions)\n`;
+        summary += `• ${intel.stats.length} stats/numbers mentioned\n`;
+        summary += `• ${intel.emphasis.length} emphasis moments found\n`;
+        summary += `• ${intel.narrative.length} narrative sections detected\n\n`;
+
+        summary += `**Suggested Overlays (${suggestions.length}):**\n`;
+        for (const s of suggestions) {
+          const timeStr = `${Math.floor(s.startMs / 60000)}:${String(Math.floor((s.startMs % 60000) / 1000)).padStart(2, '0')}`;
+          summary += `• **${s.type}** at ${timeStr} — "${s.text?.substring(0, 40) || ''}"\n`;
+        }
+
+        if (intel.emphasis.length > 0) {
+          summary += `\n**Key Moments to Highlight:**\n`;
+          for (const em of intel.emphasis.slice(0, 5)) {
+            const timeStr = `${Math.floor(em.startMs / 60000)}:${String(Math.floor((em.startMs % 60000) / 1000)).padStart(2, '0')}`;
+            summary += `• ${timeStr} — "${em.text}" (${em.reason})\n`;
+          }
+        }
+
+        summary += '\nType **"apply enhancements"** to auto-generate animations at these key moments, or **"add 5 animations"** to use smart placement with batch animations.';
+
+        setChatHistory(prev => [...prev, { type: 'assistant', text: summary }]);
+
+        // Store intelligence data for later use by batch animations
+        (window as Record<string, unknown>).__autoEnhanceData = data;
+      } catch (error) {
+        setChatHistory(prev => [...prev, {
+          type: 'assistant',
+          text: `Auto-enhance failed: ${error instanceof Error ? error.message : 'Unknown error'}. Make sure the server is running.`,
+        }]);
+      }
+      setIsProcessing(false);
+      return;
+    }
+
     // Auto-GIF
     if (workflow === 'auto-gif') {
       if (!hasVideo) {
@@ -4253,6 +4525,23 @@ export default function AIPromptPanel({
                       </div>
                     )}
 
+                    {/* Save as FrameForge template */}
+                    {message.saveTemplateData && !message.templateSaved && (
+                      <button
+                        onClick={() => {
+                          const name = window.prompt('Template name:', `${message.saveTemplateData!.style} - ${message.saveTemplateData!.content.substring(0, 20)}`);
+                          if (name) {
+                            saveTemplate(name, message.saveTemplateData!.style, message.saveTemplateData!.content);
+                            setChatHistory(prev => prev.map((m, mi) => mi === idx ? { ...m, templateSaved: true } : m));
+                          }
+                        }}
+                        className="mt-1 flex items-center gap-1 text-xs text-purple-400 hover:text-purple-300 transition-colors"
+                      >⭐ Save as Template</button>
+                    )}
+                    {message.templateSaved && (
+                      <div className="mt-1 text-xs text-purple-400/60">⭐ Saved to templates</div>
+                    )}
+
                     {/* Undo button for reversible workflows */}
                     {message.applied && message.undoData && !message.undone && onUndoWorkflow && (
                       <button
@@ -4412,7 +4701,7 @@ export default function AIPromptPanel({
       )}
 
       {/* Input */}
-      <form onSubmit={handleSubmit} className="p-4 border-t border-zinc-800/50">
+      <form onSubmit={handleSubmit} data-ai-form className="p-4 border-t border-zinc-800/50">
         {/* Motion Graphics Button */}
         <button
           type="button"
@@ -4423,6 +4712,110 @@ export default function AIPromptPanel({
           <Wand2 className="w-4 h-4" />
           Motion Graphics
         </button>
+
+        {/* FrameForge Style Picker */}
+        <button
+          type="button"
+          onClick={() => setShowStylePicker(!showStylePicker)}
+          disabled={isProcessing || !hasVideo}
+          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 mb-2 rounded-lg text-sm font-medium transition-all bg-gradient-to-r from-purple-500/20 to-blue-500/20 hover:from-purple-500/30 hover:to-blue-500/30 text-purple-300 hover:text-purple-200 border border-purple-500/30 hover:border-purple-500/50 disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          🎨 FrameForge Styles
+        </button>
+
+        {showStylePicker && (
+          <div className="mb-3 p-3 rounded-lg border border-purple-500/20 bg-zinc-900/80 max-h-80 overflow-y-auto">
+            {savedTemplates.length > 0 && (
+              <>
+                <div className="text-xs font-medium text-amber-400 mb-2">My Templates:</div>
+                <div className="grid grid-cols-2 gap-1.5 mb-3">
+                  {savedTemplates.map((tmpl, ti) => (
+                    <div key={ti} className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={isProcessing}
+                        onClick={() => {
+                          setShowStylePicker(false);
+                          setPrompt(`${tmpl.style.toLowerCase()} about ${tmpl.content}`);
+                          setTimeout(() => {
+                            const form = document.querySelector('[data-ai-form]') as HTMLFormElement;
+                            if (form) form.requestSubmit();
+                          }, 150);
+                        }}
+                        className="flex-1 flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium bg-gradient-to-r from-amber-500/20 to-orange-500/20 border border-amber-500/30 text-amber-200 hover:opacity-80 truncate"
+                      >
+                        <span>⭐</span>
+                        <span className="truncate">{tmpl.name}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteTemplate(ti)}
+                        className="px-1.5 py-1.5 rounded text-zinc-500 hover:text-red-400 text-xs"
+                      >✕</button>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="text-xs font-medium text-zinc-400 mb-2">Click a style to add at current playhead position:</div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {[
+                { name: 'Neon Glow', emoji: '💜', color: 'from-purple-500/20 to-cyan-500/20 border-purple-500/30 text-purple-200' },
+                { name: 'Glassmorphism', emoji: '🪟', color: 'from-white/5 to-white/10 border-white/20 text-zinc-200' },
+                { name: 'Bold Typography', emoji: '🔤', color: 'from-zinc-500/20 to-zinc-600/20 border-zinc-500/30 text-zinc-200' },
+                { name: 'Data Dashboard', emoji: '📊', color: 'from-blue-500/20 to-green-500/20 border-blue-500/30 text-blue-200' },
+                { name: 'Split Reveal', emoji: '↔️', color: 'from-indigo-500/20 to-amber-500/20 border-indigo-500/30 text-indigo-200' },
+                { name: 'Particle Burst', emoji: '✨', color: 'from-pink-500/20 to-purple-500/20 border-pink-500/30 text-pink-200' },
+                { name: 'Kinetic Stack', emoji: '📚', color: 'from-orange-500/20 to-red-500/20 border-orange-500/30 text-orange-200' },
+                { name: 'Spotlight', emoji: '🔦', color: 'from-yellow-500/20 to-zinc-500/20 border-yellow-500/30 text-yellow-200' },
+                { name: 'Gradient Wave', emoji: '🌊', color: 'from-orange-500/20 to-pink-500/20 border-orange-500/30 text-orange-200' },
+                { name: 'Card Flip', emoji: '🃏', color: 'from-blue-500/20 to-indigo-500/20 border-blue-500/30 text-blue-200' },
+                { name: 'Typewriter Terminal', emoji: '💻', color: 'from-green-500/20 to-green-600/20 border-green-500/30 text-green-200' },
+                { name: 'Retro VHS', emoji: '📼', color: 'from-amber-500/20 to-red-500/20 border-amber-500/30 text-amber-200' },
+                { name: 'Minimalist Line Art', emoji: '✏️', color: 'from-zinc-400/10 to-zinc-500/10 border-zinc-400/30 text-zinc-300' },
+                { name: 'Magazine Layout', emoji: '📰', color: 'from-red-500/20 to-zinc-500/20 border-red-500/30 text-red-200' },
+                { name: 'Isometric Icons', emoji: '🧊', color: 'from-teal-500/20 to-purple-500/20 border-teal-500/30 text-teal-200' },
+                { name: 'Progress Journey', emoji: '🗺️', color: 'from-blue-500/20 to-blue-600/20 border-blue-500/30 text-blue-200' },
+                { name: 'Quote Showcase', emoji: '💬', color: 'from-zinc-500/20 to-zinc-600/20 border-zinc-400/30 text-zinc-200' },
+                { name: 'Comparison Split', emoji: '⚖️', color: 'from-red-500/20 to-green-500/20 border-zinc-500/30 text-zinc-200' },
+                { name: 'Emoji Explosion', emoji: '🎉', color: 'from-yellow-500/20 to-pink-500/20 border-yellow-500/30 text-yellow-200' },
+                { name: 'Blueprint Grid', emoji: '📐', color: 'from-blue-600/20 to-blue-700/20 border-blue-600/30 text-blue-200' },
+                { name: 'Countdown Timer', emoji: '⏱️', color: 'from-red-500/20 to-orange-500/20 border-red-500/30 text-red-200' },
+                { name: 'Stacked Bars', emoji: '📈', color: 'from-green-500/20 to-blue-500/20 border-green-500/30 text-green-200' },
+                { name: 'Floating Bubbles', emoji: '🫧', color: 'from-cyan-500/20 to-blue-500/20 border-cyan-500/30 text-cyan-200' },
+                { name: 'Cinematic Bars', emoji: '🎬', color: 'from-zinc-600/20 to-zinc-700/20 border-zinc-500/30 text-zinc-200' },
+                { name: 'Morphing Shapes', emoji: '🔮', color: 'from-purple-500/20 to-pink-500/20 border-purple-500/30 text-purple-200' },
+                { name: 'Newspaper Headline', emoji: '📢', color: 'from-red-600/20 to-red-700/20 border-red-600/30 text-red-200' },
+                { name: 'Reveal Wipe', emoji: '🪄', color: 'from-amber-500/20 to-yellow-500/20 border-amber-500/30 text-amber-200' },
+                { name: 'Orbit System', emoji: '🪐', color: 'from-indigo-500/20 to-purple-500/20 border-indigo-500/30 text-indigo-200' },
+                { name: 'Watercolor Splash', emoji: '🎨', color: 'from-pink-400/20 to-purple-400/20 border-pink-400/30 text-pink-200' },
+              ].map(style => (
+                <button
+                  key={style.name}
+                  type="button"
+                  disabled={isProcessing}
+                  onClick={() => {
+                    const styleLower = style.name.toLowerCase();
+                    const content = window.prompt(`What should the "${style.name}" animation say?`, style.name);
+                    if (content) {
+                      setShowStylePicker(false);
+                      setPrompt(`${styleLower} about ${content}`);
+                      // Auto-submit after prompt is set
+                      setTimeout(() => {
+                        const form = document.querySelector('[data-ai-form]') as HTMLFormElement;
+                        if (form) form.requestSubmit();
+                      }, 150);
+                    }
+                  }}
+                  className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-medium transition-all bg-gradient-to-r ${style.color} hover:opacity-80 disabled:opacity-50`}
+                >
+                  <span>{style.emoji}</span>
+                  <span className="truncate">{style.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Quick Actions Popover */}
         <div className="relative mb-3" ref={quickActionsRef}>

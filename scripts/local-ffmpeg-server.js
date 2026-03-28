@@ -806,6 +806,225 @@ function formatTimestamp(seconds) {
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+// Auto-enhance: Analyse transcript and suggest overlay enhancements
+// Uses FrameForge-inspired transcript intelligence (pure computation, no external deps)
+async function handleAutoEnhance(req, res) {
+  try {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    const { words, duration, width, height } = JSON.parse(body || '{}');
+
+    if (!words || !words.length) {
+      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.end(JSON.stringify({ error: 'No words provided. Transcribe the video first.' }));
+      return;
+    }
+
+    const durationMs = (duration || words[words.length - 1].end + 1) * 1000;
+
+    // Build phrases from words (group by pauses)
+    const phrases = [];
+    let currentPhrase = [];
+    for (let i = 0; i < words.length; i++) {
+      currentPhrase.push(words[i]);
+      const isLast = i === words.length - 1;
+      const nextWord = isLast ? null : words[i + 1];
+      const gap = nextWord ? nextWord.start - words[i].end : 1;
+
+      if (gap > 0.5 || isLast) {
+        phrases.push({
+          text: currentPhrase.map(w => w.text).join(' '),
+          startMs: Math.round(currentPhrase[0].start * 1000),
+          endMs: Math.round(currentPhrase[currentPhrase.length - 1].end * 1000),
+          startSec: currentPhrase[0].start,
+          endSec: currentPhrase[currentPhrase.length - 1].end,
+        });
+        currentPhrase = [];
+      }
+    }
+
+    // Detect pauses (gaps > 400ms)
+    const pauses = [];
+    for (let i = 0; i < words.length - 1; i++) {
+      const gap = words[i + 1].start - words[i].end;
+      if (gap >= 0.4) {
+        pauses.push({
+          startMs: Math.round(words[i].end * 1000),
+          endMs: Math.round(words[i + 1].start * 1000),
+          durationMs: Math.round(gap * 1000),
+          type: gap > 1.5 ? 'transition' : gap > 0.6 ? 'beat' : 'breath',
+        });
+      }
+    }
+
+    // Detect stats (numbers, percentages, dollars)
+    const stats = [];
+    const statPatterns = [
+      /\$[\d,.]+[BKMGT]?/gi,
+      /\d+(\.\d+)?%/g,
+      /\d+x\b/gi,
+      /\b\d{2,}\+?\b/g,
+    ];
+    for (const phrase of phrases) {
+      for (const pattern of statPatterns) {
+        pattern.lastIndex = 0;
+        const matches = phrase.text.match(pattern);
+        if (matches) {
+          for (const match of matches) {
+            stats.push({
+              value: match,
+              text: phrase.text,
+              startMs: phrase.startMs,
+              endMs: phrase.endMs,
+            });
+          }
+        }
+      }
+    }
+
+    // Detect emphasis moments
+    const emphasis = [];
+    for (let i = 0; i < phrases.length; i++) {
+      const p = phrases[i];
+      const wordCount = p.text.split(/\s+/).length;
+      let weight = 0;
+      let reason = '';
+
+      // Short punchy phrases (1-4 words)
+      if (wordCount <= 4 && wordCount >= 1) { weight += 2; reason = 'short-phrase'; }
+      // Phrase after a long pause
+      if (i > 0 && pauses.some(pa => Math.abs(pa.endMs - p.startMs) < 200 && pa.type === 'transition')) {
+        weight += 2; reason = reason || 'pause-before';
+      }
+      // Contains a stat
+      if (stats.some(s => s.startMs === p.startMs)) { weight += 1; reason = reason || 'number'; }
+      // ALL CAPS words
+      if (/\b[A-Z]{2,}\b/.test(p.text)) { weight += 1; reason = reason || 'all-caps'; }
+
+      if (weight >= 2) {
+        emphasis.push({
+          text: p.text,
+          startMs: p.startMs,
+          endMs: p.endMs,
+          reason,
+          weight,
+        });
+      }
+    }
+
+    // Build energy curve (words per second over 3s windows)
+    const energyCurve = [];
+    for (let t = 0; t < durationMs; t += 500) {
+      const windowWords = words.filter(w => w.start * 1000 >= t && w.start * 1000 < t + 3000);
+      const wps = Math.round(windowWords.length / 3 * 100) / 100;
+      energyCurve.push({ timeMs: t, wps, isHigh: wps > 3.5, isLow: wps < 1.5 });
+    }
+
+    // Detect narrative structure (simple heuristic)
+    const totalPhrases = phrases.length;
+    const narrative = [];
+    if (totalPhrases >= 4) {
+      narrative.push({ type: 'hook', startMs: phrases[0].startMs, endMs: phrases[Math.min(1, totalPhrases - 1)].endMs });
+      const setupEnd = Math.floor(totalPhrases * 0.3);
+      narrative.push({ type: 'setup', startMs: phrases[2]?.startMs || 0, endMs: phrases[setupEnd]?.endMs || 0 });
+      const climaxStart = Math.floor(totalPhrases * 0.7);
+      narrative.push({ type: 'climax', startMs: phrases[climaxStart]?.startMs || 0, endMs: phrases[Math.min(climaxStart + 2, totalPhrases - 1)]?.endMs || 0 });
+      narrative.push({ type: 'cta', startMs: phrases[totalPhrases - 2]?.startMs || 0, endMs: phrases[totalPhrases - 1]?.endMs || 0 });
+    }
+
+    // Generate overlay suggestions (pause-aligned)
+    const suggestions = [];
+
+    // Hook card in first 5s
+    if (phrases.length > 0) {
+      suggestions.push({
+        type: 'hook-card',
+        startMs: 200,
+        endMs: Math.min(5000, phrases[0].endMs + 500),
+        text: phrases[0].text,
+        position: 'top-center',
+      });
+    }
+
+    // Emphasis overlays at key moments
+    for (const em of emphasis.slice(0, 5)) {
+      suggestions.push({
+        type: 'emphasis',
+        startMs: em.startMs,
+        endMs: em.endMs,
+        text: em.text,
+        reason: em.reason,
+        weight: em.weight,
+        position: 'top-center',
+      });
+    }
+
+    // Stat callouts
+    for (const st of stats.slice(0, 3)) {
+      suggestions.push({
+        type: 'stat-callout',
+        startMs: st.startMs,
+        endMs: st.endMs + 2000,
+        text: st.value,
+        context: st.text,
+        position: 'top-right',
+      });
+    }
+
+    // Chapter markers at transition pauses
+    const transitionPauses = pauses.filter(p => p.type === 'transition');
+    for (const tp of transitionPauses.slice(0, 4)) {
+      const nextPhrase = phrases.find(p => p.startMs >= tp.endMs);
+      if (nextPhrase) {
+        suggestions.push({
+          type: 'chapter-marker',
+          startMs: tp.endMs,
+          endMs: tp.endMs + 2500,
+          text: nextPhrase.text.split(' ').slice(0, 5).join(' ') + '...',
+          position: 'top-center',
+        });
+      }
+    }
+
+    // CTA at the end
+    if (duration > 10) {
+      suggestions.push({
+        type: 'cta-card',
+        startMs: (duration - 4) * 1000,
+        endMs: (duration - 0.5) * 1000,
+        text: 'Follow for more',
+        position: 'top-center',
+      });
+    }
+
+    const result = {
+      intelligence: {
+        pauses,
+        stats,
+        emphasis,
+        narrative,
+        speechStats: {
+          totalWords: words.length,
+          avgWordsPerSecond: Math.round(words.length / (duration || 1) * 100) / 100,
+          totalPauses: pauses.length,
+          longestPauseMs: pauses.length ? Math.max(...pauses.map(p => p.durationMs)) : 0,
+        },
+      },
+      suggestions,
+      phraseCount: phrases.length,
+    };
+
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify(result));
+    console.log(`[auto-enhance] Analysed ${words.length} words, ${phrases.length} phrases, ${suggestions.length} suggestions`);
+
+  } catch (error) {
+    console.error('Auto-enhance error:', error);
+    res.writeHead(500, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({ error: error.message }));
+  }
+}
+
 // Generate chapters from video using AI
 async function handleGenerateChapters(req, res) {
   const jobId = randomUUID();
@@ -2642,8 +2861,17 @@ async function handleProjectRender(req, res, sessionId) {
 
     // ===== RENDER CAPTIONS (T1 track) =====
     // Get caption clips from T1 and render them as drawtext overlays
+    // FrameForge styles (highlight, bold-center, minimal) get rendered as video overlays
     const captionClips = clips.filter(c => c.trackId === 'T1');
     const captionData = session.project.captionData || {};
+
+    // Check if any captions use FrameForge styles
+    const FRAMEFORGE_CAPTION_STYLES = ['highlight', 'bold-center', 'minimal'];
+    const frameforgeCapLocs = [
+      join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'workspace', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
+      join(process.cwd(), '..', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
+    ];
+    const ffCapCliPath = frameforgeCapLocs.find(p => existsSync(p));
 
     if (captionClips.length > 0) {
       console.log(`[${sessionId}] Rendering ${captionClips.length} caption clips`);
@@ -2699,6 +2927,147 @@ async function handleProjectRender(req, res, sessionId) {
             : '/Windows/Fonts/arial.ttf';
 
         renderDebugLines.push(`  Caption clip ${captionClip.id}: ${words.length} words, style=${JSON.stringify(style)}`);
+
+        // FrameForge caption rendering for enhanced styles
+        if (FRAMEFORGE_CAPTION_STYLES.includes(animation) && ffCapCliPath) {
+          console.log(`[${sessionId}] Rendering FrameForge captions (${animation} style)...`);
+
+          // Build word groups (2-4 words per group)
+          const groups = [];
+          let currentGroup = [];
+          for (let wi = 0; wi < words.length; wi++) {
+            currentGroup.push(words[wi]);
+            const isLast = wi === words.length - 1;
+            const nextWord = isLast ? null : words[wi + 1];
+            let shouldBreak = currentGroup.length >= 4 || isLast;
+            if (nextWord && nextWord.start - words[wi].end > 0.3) shouldBreak = true;
+            if (/[.,!?;:]$/.test(words[wi].text)) shouldBreak = true;
+            if (shouldBreak && currentGroup.length > 0) {
+              groups.push({
+                words: currentGroup.map(w => ({ text: w.text, startMs: Math.round((captionClip.start + w.start + timeOffset) * 1000), endMs: Math.round((captionClip.start + w.end + timeOffset) * 1000) })),
+                startMs: Math.round((captionClip.start + currentGroup[0].start + timeOffset) * 1000),
+                endMs: Math.round((captionClip.start + currentGroup[currentGroup.length - 1].end + timeOffset) * 1000),
+                text: currentGroup.map(w => w.text).join(' '),
+              });
+              currentGroup = [];
+            }
+          }
+
+          const hlColor = style.highlightColor || '#FFD700';
+          const txtColor = style.color || '#ffffff';
+          const capFontSize = Math.round((style.fontSize || 24) * (settings.width / 360));
+
+          // Position
+          let capY = 'bottom: 8%';
+          if (position === 'top') capY = 'top: 8%';
+          else if (position === 'center') capY = 'top: 50%; transform: translate(-50%, -50%)';
+
+          // Build animation logic per style
+          let wordStyleFn = '';
+          if (animation === 'highlight') {
+            wordStyleFn = `
+              var isActive = t >= w.startMs && t < w.endMs;
+              el.style.padding = '2px 6px';
+              el.style.margin = '0 3px';
+              el.style.borderRadius = '4px';
+              el.style.display = 'inline-block';
+              el.style.backgroundColor = isActive ? '${hlColor}' : 'transparent';
+              el.style.color = isActive ? '#000' : '${txtColor}';
+              el.style.transform = isActive ? 'scale(1.12)' : 'scale(1)';
+              el.style.transition = 'all 0.12s ease';`;
+          } else if (animation === 'bold-center') {
+            wordStyleFn = `
+              var isActive = t >= w.startMs && t < w.endMs;
+              var hasStarted = t >= w.startMs;
+              el.style.display = 'inline-block';
+              el.style.textTransform = 'uppercase';
+              el.style.letterSpacing = '2px';
+              el.style.margin = '0 6px';
+              el.style.transform = isActive ? 'scale(1.5)' : hasStarted ? 'scale(1.1)' : 'scale(0.8)';
+              el.style.opacity = hasStarted ? '1' : '0';
+              el.style.color = isActive ? '${hlColor}' : '${txtColor}';
+              el.style.transition = 'all 0.15s ease';`;
+          } else { // minimal
+            wordStyleFn = `
+              var hasStarted = t >= w.startMs;
+              el.style.display = 'inline-block';
+              el.style.margin = '0 4px';
+              el.style.opacity = hasStarted ? '1' : '0';
+              el.style.transition = 'all 0.25s ease-out';`;
+          }
+
+          const captionHtml = `<!DOCTYPE html>
+<html><head><style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:${settings.width}px;height:${settings.height}px;overflow:hidden;background:#00ff00;font-family:'Inter',system-ui,sans-serif}
+#cap{position:absolute;left:50%;${capY.includes('translate') ? capY : capY};${capY.includes('translate') ? '' : 'transform:translateX(-50%)'};text-align:center;width:90%;z-index:9999;pointer-events:none}
+.grp{display:none;background:${animation === 'highlight' ? 'rgba(0,0,0,0.85)' : 'transparent'};padding:${animation === 'highlight' ? '12px 24px' : '8px'};border-radius:12px;${animation === 'highlight' ? 'backdrop-filter:blur(8px);' : ''}}
+.grp.active{display:inline-block}
+.w{font-size:${capFontSize}px;font-weight:900;color:${txtColor};line-height:1.3}
+</style></head><body>
+<div id="cap"></div>
+<script>
+var groups=${JSON.stringify(groups)};
+var cap=document.getElementById('cap');
+groups.forEach(function(g,gi){
+  var div=document.createElement('div');div.className='grp';div.id='g'+gi;
+  g.words.forEach(function(w){
+    var s=document.createElement('span');s.className='w';s.textContent=w.text;s.dataset.s=w.startMs;s.dataset.e=w.endMs;
+    div.appendChild(s);
+  });
+  cap.appendChild(div);
+});
+function update(){
+  var t=performance.now();
+  groups.forEach(function(g,gi){
+    var el=document.getElementById('g'+gi);
+    if(t>=g.startMs&&t<=g.endMs+150){el.classList.add('active')}else{el.classList.remove('active')}
+    if(el.classList.contains('active')){
+      var spans=el.querySelectorAll('.w');
+      for(var si=0;si<spans.length;si++){
+        var w={startMs:parseInt(spans[si].dataset.s),endMs:parseInt(spans[si].dataset.e)};
+        var el2=spans[si];
+        ${wordStyleFn}
+      }
+    }
+  });
+  requestAnimationFrame(update);
+}
+requestAnimationFrame(update);
+</script></body></html>`;
+
+          const capHtmlPath = join(session.dir, `caption_overlay_${captionClip.id}.html`);
+          const capVideoPath = join(session.dir, `caption_overlay_${captionClip.id}.mp4`);
+          writeFileSync(capHtmlPath, captionHtml);
+
+          // Render caption overlay with FrameForge
+          try {
+            const capDuration = Math.ceil(totalDuration);
+            const { execSync: execSyncLocal } = await import('child_process');
+            execSyncLocal(`node "${ffCapCliPath}" render "${capHtmlPath}" --output "${capVideoPath}" --duration ${capDuration} --width ${settings.width} --height ${settings.height}`, {
+              stdio: 'pipe',
+              env: { ...process.env },
+              timeout: 300000,
+            });
+
+            // Add as input and overlay with chroma key
+            inputs.push('-i', capVideoPath);
+            const capInputIdx = inputIndex++;
+            filterParts.push(`[${capInputIdx}:v]colorkey=0x00ff00:0.3:0.2[ffcap${captionClip.id}]`);
+            filterParts.push(`[${lastVideo}][ffcap${captionClip.id}]overlay=0:0:shortest=1[ffcapout${captionClip.id}]`);
+            lastVideo = `ffcapout${captionClip.id}`;
+
+            console.log(`[${sessionId}] FrameForge caption overlay rendered (${capDuration}s)`);
+          } catch (ffCapErr) {
+            console.error(`[${sessionId}] FrameForge caption render failed, falling back to drawtext:`, ffCapErr.message?.substring(0, 200));
+            // Fall through to drawtext below
+          }
+
+          try { unlinkSync(capHtmlPath); } catch (e) {}
+          // Skip drawtext for this clip if FrameForge succeeded
+          if (existsSync(capVideoPath)) continue;
+        }
 
         // Group words into phrases (max 5 words or ~30 chars per phrase for readability)
         const phrases = [];
@@ -7352,49 +7721,131 @@ ${attachedAssetIds?.length ? `- IMPORTANT: Include media scenes to showcase the 
     writeFileSync(propsPath, JSON.stringify(sceneData, null, 2));
     console.log(`[${jobId}] Props written to ${propsPath}`);
 
-    // Step 3: Render with Remotion CLI
-    console.log(`[${jobId}] Rendering with Remotion...`);
-
-    const remotionArgs = [
-      'remotion', 'render',
-      'src/remotion/index.tsx',
-      'DynamicAnimation',
-      outputPath,
-      '--props', propsPath,
-      '--frames', `0-${totalDuration - 1}`,
-      '--fps', String(fps),
-      '--width', String(width),
-      '--height', String(height),
-      '--codec', 'h264',
-      '--overwrite',
-      '--gl=angle', // Use Metal GPU acceleration on macOS
+    // Check if this is a FrameForge style request
+    const frameforgeStyleMatch = description.match(/FRAMEFORGE STYLE:\s*([^.]+)/);
+    const frameforgeLocations = [
+      join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'workspace', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
+      join(process.cwd(), '..', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
     ];
+    const frameforgeCliPath = frameforgeLocations.find(p => existsSync(p));
+    const useFrameForge = frameforgeStyleMatch && frameforgeCliPath;
 
-    await new Promise((resolve, reject) => {
-      const proc = spawn(NPX_CMD, remotionArgs, {
-        cwd: process.cwd(),
-        stdio: ['pipe', 'pipe', 'pipe'],
-        shell: process.platform === 'win32',
+    if (useFrameForge) {
+      // FrameForge rendering path
+      const requestedStyle = frameforgeStyleMatch[1].trim();
+      console.log(`[${jobId}] Using FrameForge with style: ${requestedStyle}`);
+
+      // Ask Gemini to generate HTML animation with the specified style
+      const ai = new GoogleGenAI({ apiKey });
+      const htmlResult = await ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{
+          role: 'user',
+          parts: [{
+            text: `Create a self-contained HTML animation in the "${requestedStyle}" visual style. This will be rendered to MP4.
+
+CONTENT/TOPIC: ${description.replace(/FRAMEFORGE STYLE:[^.]+\./, '').trim()}
+DURATION: ${(totalDuration / fps).toFixed(0)} seconds
+SIZE: ${width}x${height}
+
+Write a COMPLETE HTML file. CRITICAL REQUIREMENTS:
+- Import Google Font Inter: @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap')
+- Set html,body to exactly ${width}px x ${height}px, overflow:hidden, dark background
+- ALL animation via requestAnimationFrame + performance.now() ONLY (no CSS @keyframes)
+- Helper functions: lerp(a,b,t), ease(t)=1-Math.pow(1-t,3), clamp(val,start,end)=Math.max(0,Math.min(1,(val-start)/(end-start)))
+- Text must be LARGE: 48-96px headings, 24-36px body
+- Stagger animations with 0.2-0.4s delays
+- Keep animating for full duration (add pulsing/floating after initial reveal)
+- DO NOT use CSS animation or @keyframes. ONLY JavaScript requestAnimationFrame.
+- DO NOT use external libraries.
+
+Visual style "${requestedStyle}" - make it distinctive and professional.
+
+Return ONLY raw HTML starting with <!DOCTYPE html>. No markdown fences.`
+          }]
+        }],
       });
 
-      let stderr = '';
-      proc.stderr.on('data', (data) => {
-        stderr += data.toString();
-        console.log(`[${jobId}] Remotion: ${data.toString().trim()}`);
+      let htmlContent = htmlResult.candidates[0].content.parts[0].text;
+      htmlContent = htmlContent.replace(/```html\n?/g, '').replace(/```\n?/g, '').trim();
+      if (!htmlContent.startsWith('<!DOCTYPE') && !htmlContent.startsWith('<html')) {
+        const htmlMatch = htmlContent.match(/<!DOCTYPE[\s\S]*<\/html>/i) || htmlContent.match(/<html[\s\S]*<\/html>/i);
+        if (htmlMatch) htmlContent = htmlMatch[0];
+      }
+
+      const htmlPath = join(session.dir, `${assetId}.html`);
+      writeFileSync(htmlPath, htmlContent);
+
+      console.log(`[${jobId}] Rendering with FrameForge...`);
+      await new Promise((resolve, reject) => {
+        const proc = spawn('node', [
+          frameforgeCliPath, 'render', htmlPath,
+          '--output', outputPath,
+          '--duration', String(Math.ceil(totalDuration / fps)),
+          '--width', String(width),
+          '--height', String(height),
+        ], {
+          cwd: process.cwd(),
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { ...process.env, GEMINI_API_KEY: apiKey },
+        });
+        let stderr = '';
+        proc.stderr.on('data', (data) => { stderr += data.toString(); });
+        proc.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`FrameForge render failed: ${stderr.substring(0, 300)}`));
+        });
+        proc.on('error', (err) => reject(new Error(`Failed to start FrameForge: ${err.message}`)));
       });
 
-      proc.on('close', (code) => {
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(new Error(`Remotion render failed with code ${code}: ${stderr}`));
-        }
-      });
+      try { unlinkSync(htmlPath); } catch (e) {}
+      console.log(`[${jobId}] FrameForge render complete`);
 
-      proc.on('error', (err) => {
-        reject(new Error(`Failed to start Remotion: ${err.message}`));
+    } else {
+      // Standard Remotion rendering path
+      console.log(`[${jobId}] Rendering with Remotion...`);
+
+      const remotionArgs = [
+        'remotion', 'render',
+        'src/remotion/index.tsx',
+        'DynamicAnimation',
+        outputPath,
+        '--props', propsPath,
+        '--frames', `0-${totalDuration - 1}`,
+        '--fps', String(fps),
+        '--width', String(width),
+        '--height', String(height),
+        '--codec', 'h264',
+        '--overwrite',
+        '--gl=angle',
+      ];
+
+      await new Promise((resolve, reject) => {
+        const proc = spawn(NPX_CMD, remotionArgs, {
+          cwd: process.cwd(),
+          stdio: ['pipe', 'pipe', 'pipe'],
+          shell: process.platform === 'win32',
+        });
+
+        let stderr = '';
+        proc.stderr.on('data', (data) => {
+          stderr += data.toString();
+          console.log(`[${jobId}] Remotion: ${data.toString().trim()}`);
+        });
+
+        proc.on('close', (code) => {
+          if (code === 0) {
+            resolve();
+          } else {
+            reject(new Error(`Remotion render failed with code ${code}: ${stderr}`));
+          }
+        });
+
+        proc.on('error', (err) => {
+          reject(new Error(`Failed to start Remotion: ${err.message}`));
+        });
       });
-    });
+    }
 
     // Step 4: Generate thumbnail
     await runFFmpeg([
@@ -8741,11 +9192,11 @@ async function handleGenerateBatchAnimations(req, res, sessionId) {
 
   try {
     const body = await parseBody(req);
-    const { count = 5, fps = 30, width = 1920, height = 1080 } = body;
+    const { count = 5, fps = 30, width = 1920, height = 1080, forcedPlan } = body;
 
     const jobId = sessionId.substring(0, 8);
     console.log(`\n[${jobId}] === GENERATE BATCH ANIMATIONS ===`);
-    console.log(`[${jobId}] Requested count: ${count}`);
+    console.log(`[${jobId}] Requested count: ${count}${forcedPlan ? ' (forced plan provided)' : ''}`);
 
     // Find the first video asset in the session
     let videoAsset = null;
@@ -8764,20 +9215,92 @@ async function handleGenerateBatchAnimations(req, res, sessionId) {
 
     console.log(`[${jobId}] Using video: ${videoAsset.filename} (${videoAsset.duration}s)`);
 
-    // Step 1: Get or create transcription
-    console.log(`[${jobId}] Step 1: Getting video transcription...`);
-    const transcription = await getOrTranscribeVideo(session, videoAsset, jobId);
-
-    if (!transcription.text) {
-      res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
-      res.end(JSON.stringify({ error: 'Could not transcribe video' }));
-      return;
+    // If a forced plan is provided, skip transcription and planning
+    let animationPlan;
+    if (forcedPlan) {
+      console.log(`[${jobId}] Using forced plan - skipping transcription and planning`);
+      animationPlan = forcedPlan;
     }
 
-    console.log(`[${jobId}] Transcription: ${transcription.text.substring(0, 200)}...`);
+    let transcription = { text: '', words: [] };
+    if (!forcedPlan) {
+      // Step 1: Get or create transcription
+      console.log(`[${jobId}] Step 1: Getting video transcription...`);
+      transcription = await getOrTranscribeVideo(session, videoAsset, jobId);
+
+      if (!transcription.text) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        res.end(JSON.stringify({ error: 'Could not transcribe video' }));
+        return;
+      }
+
+      console.log(`[${jobId}] Transcription: ${transcription.text.substring(0, 200)}...`);
+    }
 
     // Step 2: Use Gemini to plan animations across the video
-    console.log(`[${jobId}] Step 2: Planning ${count} animations with AI...`);
+    if (!forcedPlan) {
+      console.log(`[${jobId}] Step 2: Planning ${count} animations with AI...`);
+
+    // Build transcript intelligence for smarter placement
+    const words = transcription.words || [];
+    let intelligenceBlock = '';
+    if (words.length > 0) {
+      // Detect emphasis moments (short punchy phrases after pauses)
+      const emphasisMoments = [];
+      const phrases = [];
+      let currentPhrase = [];
+      for (let i = 0; i < words.length; i++) {
+        currentPhrase.push(words[i]);
+        const isLast = i === words.length - 1;
+        const nextWord = isLast ? null : words[i + 1];
+        const gap = nextWord ? nextWord.start - words[i].end : 1;
+        if (gap > 0.5 || isLast) {
+          const text = currentPhrase.map(w => w.text).join(' ');
+          const startMs = Math.round(currentPhrase[0].start * 1000);
+          const endMs = Math.round(currentPhrase[currentPhrase.length - 1].end * 1000);
+          phrases.push({ text, startMs, endMs });
+          if (currentPhrase.length <= 4 && currentPhrase.length >= 1) {
+            emphasisMoments.push({ text, time: currentPhrase[0].start.toFixed(1) });
+          }
+          currentPhrase = [];
+        }
+      }
+
+      // Detect stats
+      const statMoments = [];
+      for (const p of phrases) {
+        if (/\$[\d,.]+|\d+%|\d+x\b|\b\d{3,}\b/.test(p.text)) {
+          statMoments.push({ text: p.text, time: (p.startMs / 1000).toFixed(1) });
+        }
+      }
+
+      // Detect topic transitions (pauses > 1.5s)
+      const transitions = [];
+      for (let i = 0; i < words.length - 1; i++) {
+        const gap = words[i + 1].start - words[i].end;
+        if (gap > 1.5) {
+          const nextPhrase = phrases.find(p => p.startMs >= words[i + 1].start * 1000);
+          if (nextPhrase) {
+            transitions.push({ time: words[i + 1].start.toFixed(1), text: nextPhrase.text.substring(0, 50) });
+          }
+        }
+      }
+
+      intelligenceBlock = `
+TRANSCRIPT INTELLIGENCE (use this for smarter placement):
+
+Key emphasis moments (short punchy phrases — great for text overlays):
+${emphasisMoments.slice(0, 10).map(e => `  [${e.time}s] "${e.text}"`).join('\n')}
+
+Stats/numbers mentioned (great for animated stat callouts):
+${statMoments.length > 0 ? statMoments.slice(0, 5).map(s => `  [${s.time}s] "${s.text}"`).join('\n') : '  None detected'}
+
+Topic transitions (great for chapter markers or transition effects):
+${transitions.slice(0, 8).map(t => `  [${t.time}s] "${t.text}"`).join('\n')}
+
+IMPORTANT: Place animations AT these detected moments, not at random timestamps. These are the moments where overlays will have the most impact.
+`;
+    }
 
     const ai = new GoogleGenAI({ apiKey });
     const planResult = await ai.models.generateContent({
@@ -8794,7 +9317,7 @@ VIDEO DURATION: ${videoAsset.duration} seconds
 
 WORD TIMESTAMPS (for timing reference):
 ${transcription.words?.slice(0, 100).map(w => `[${w.start.toFixed(1)}s] ${w.text}`).join(' ') || 'Not available'}
-
+${intelligenceBlock}
 Plan exactly ${count} animations. Each should:
 1. Be placed at a strategic moment in the video (intro, key points, transitions, outro)
 2. Have a specific purpose (introduce topic, highlight key point, transition, call-to-action, etc.)
@@ -8819,12 +9342,13 @@ Guidelines:
 - Last animation could be an outro or call-to-action
 - Space animations throughout the video, not clustered together
 - Each animation should enhance understanding or engagement
-- Be specific about visual style, colors, and text content`
+- Be specific about visual style, colors, and text content
+- Use the transcript intelligence data above to place animations at the most impactful moments`
         }]
       }],
     });
 
-    let animationPlan;
+    // Close the planning block (only runs when no forcedPlan)
     try {
       const planText = planResult.candidates[0].content.parts[0].text;
       const cleanedPlan = planText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
@@ -8833,6 +9357,7 @@ Guidelines:
       console.error(`[${jobId}] Failed to parse animation plan:`, parseError);
       throw new Error('Failed to parse AI animation plan');
     }
+    } // end if (!forcedPlan)
 
     console.log(`[${jobId}] Planned ${animationPlan.animations.length} animations`);
     animationPlan.animations.forEach((a, i) => {
@@ -8853,123 +9378,317 @@ Guidelines:
       const propsPath = join(session.dir, `${jobId}-batch-${i}-props.json`);
       const sceneDataPath = join(session.dir, `${assetId}-scenes.json`);
 
-      // Generate scene data with Gemini
+      // Pick a unique visual style for each animation to ensure variety
+      const VISUAL_STYLES = [
+        {
+          name: 'Neon Glow',
+          desc: 'Dark background with neon glowing text and borders. Colors: cyan #00f0ff, magenta #ff00ff, electric blue #0066ff. Text has text-shadow glow effects (0 0 20px color). Thin neon border lines that pulse. Subtle grid pattern background.',
+          bg: '#050510',
+        },
+        {
+          name: 'Glassmorphism',
+          desc: 'Frosted glass panels with backdrop-filter: blur(20px). Semi-transparent white backgrounds (rgba(255,255,255,0.08)). Subtle white borders (rgba(255,255,255,0.15)). Soft shadows. Content floats in from different directions. Gradient accent line.',
+          bg: '#0f0f1a',
+        },
+        {
+          name: 'Bold Typography',
+          desc: 'Massive bold text (100-200px) that fills the screen. Words animate in one by one with scale + rotation. Mix of font weights (400 and 900). Accent color backgrounds behind key words. Minimal - just text, no boxes or panels.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Data Dashboard',
+          desc: 'Animated charts, progress bars, and counters. Numbers count up from 0 to target. Horizontal bars that grow. Circular progress rings using SVG. Clean grid layout with labeled metrics. Monospace numbers.',
+          bg: '#0d1117',
+        },
+        {
+          name: 'Split Reveal',
+          desc: 'Screen splits into 2-3 columns or rows that slide in from edges. Each section has different content. Diagonal dividers using clip-path. Bold color blocks (indigo, amber, emerald). Content staggers in per section.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Particle Burst',
+          desc: 'Central text with animated dots/circles that radiate outward. Use multiple small div elements animated with CSS transforms. Particles have different sizes, speeds, and opacity. Creates energy/excitement feel. Starburst effect.',
+          bg: '#080818',
+        },
+        {
+          name: 'Kinetic Stack',
+          desc: 'Multiple text lines that stack vertically, each sliding in from alternating sides (left, right, left). Different font sizes creating visual hierarchy. Lines have colored underlines or highlights that wipe in. Bottom-to-top build.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Spotlight Focus',
+          desc: 'Dark background with a circular radial gradient spotlight that moves or pulses. Main text in the spotlight. Secondary text fades in around it. Dramatic, cinematic feel. Use radial-gradient for the spotlight effect.',
+          bg: '#050505',
+        },
+        {
+          name: 'Gradient Wave',
+          desc: 'Animated gradient backgrounds that shift colors. Text has gradient fill using background-clip: text. Wavy underlines or decorative elements. Smooth color transitions. Vibrant: orange to pink to purple.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Card Flip',
+          desc: 'Content presented on cards that flip, rotate, or slide into position. Cards have rounded corners, subtle borders, and inner shadows. Information organized in card grid. Each card animates in with a bounce effect.',
+          bg: '#0f0f1a',
+        },
+        {
+          name: 'Typewriter Terminal',
+          desc: 'Green monospace text on black, like a hacking terminal. Text types out character by character. Blinking cursor. Scanline effect using repeating-linear-gradient. Command prompt style (> prefix). Matrix vibes.',
+          bg: '#000000',
+        },
+        {
+          name: 'Retro VHS',
+          desc: 'Distorted retro look. Text has chromatic aberration (offset red/blue shadows). Slight skew transforms. Grainy noise overlay using random positioned tiny divs. Bold chunky text. Warm amber/orange palette on dark.',
+          bg: '#0a0808',
+        },
+        {
+          name: 'Minimalist Line Art',
+          desc: 'Ultra clean. Thin white lines that draw themselves (width animates from 0). Small elegant text (32-48px). Lots of whitespace. Single accent color. Geometric shapes (circles, lines) animate in. Apple keynote style.',
+          bg: '#000000',
+        },
+        {
+          name: 'Magazine Layout',
+          desc: 'Bold editorial design. Mix huge serif text with small sans-serif. Overlapping elements. One word per line at different sizes. Red/black/white palette. Rotated text elements. Fashion magazine energy.',
+          bg: '#f5f0eb',
+        },
+        {
+          name: 'Isometric Icons',
+          desc: 'CSS-only 3D isometric shapes (transform: rotateX(45deg) rotateZ(45deg)). Colored blocks that stack and build. Grid of isometric cubes/shapes. Tech/startup feel. Purple/teal/coral palette.',
+          bg: '#0d0d1a',
+        },
+        {
+          name: 'Progress Journey',
+          desc: 'Horizontal timeline/roadmap that builds left to right. Dots connected by animated lines. Labels appear at each node. Progress percentage counter. Shows a journey or process. Clean blue/white.',
+          bg: '#0a1628',
+        },
+        {
+          name: 'Quote Showcase',
+          desc: 'Large quotation marks (200px, low opacity). Quote text centered and large. Author/source below. Elegant serif font feel (use Inter weight 400 for quotes). Subtle animated border that traces around the quote box.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Comparison Split',
+          desc: 'Screen divided vertically. Left side: red tinted "Before/Problem". Right side: green tinted "After/Solution". Content slides in from each side. Divider line animates down the middle. VS badge in center.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Emoji Explosion',
+          desc: 'Large relevant emoji (80-120px) that bounce in from random positions. Main text in center. Emojis orbit or float around the text. Playful and energetic. Use CSS transforms for positioning. Bright colorful feel.',
+          bg: '#0a0a14',
+        },
+        {
+          name: 'Blueprint Grid',
+          desc: 'Blue background with white grid lines (like graph paper/blueprint). White text and line drawings. Technical feel. Elements draw on like a blueprint being sketched. Architectural vibe. Thin white borders.',
+          bg: '#1a3a5c',
+        },
+        {
+          name: 'Countdown Timer',
+          desc: 'Large animated numbers counting down or up. Digital clock style. Each digit flips or morphs. Supporting text around the number. Urgency feel. Red/orange accent on dark. Pulsing glow on the numbers.',
+          bg: '#0a0505',
+        },
+        {
+          name: 'Stacked Bars',
+          desc: 'Horizontal bars that grow from left with different widths representing data. Labels on each bar. Bars stagger in one by one from top. Color coded (each bar different shade). Clean data visualization.',
+          bg: '#0d1117',
+        },
+        {
+          name: 'Floating Bubbles',
+          desc: 'Text inside circular bubbles that float up and settle into position. Bubbles have soft gradients and subtle shadows. Different sizes for hierarchy. Connected by thin lines. Mind-map feel.',
+          bg: '#080820',
+        },
+        {
+          name: 'Cinematic Bars',
+          desc: 'Letterbox black bars top and bottom that slide in first. Then text appears in the cinematic widescreen area. Film grain texture. Subtle camera shake effect (tiny random transforms). Movie title card energy.',
+          bg: '#000000',
+        },
+        {
+          name: 'Morphing Shapes',
+          desc: 'Abstract background shapes (blobs using border-radius: 50%) that slowly morph and shift colors. Text overlaid on top. Shapes are large, blurred, and colorful (purple, blue, pink). Dreamy ambient feel.',
+          bg: '#0a0a1a',
+        },
+        {
+          name: 'Newspaper Headline',
+          desc: 'Breaking news style. "BREAKING" banner slides in from top. Large headline text. Scrolling ticker at bottom. Red/white/black palette. Bold, urgent feel. News channel lower third style elements.',
+          bg: '#1a0000',
+        },
+        {
+          name: 'Reveal Wipe',
+          desc: 'Content hidden behind a colored panel that wipes away (clip-path animation via JS). Reveals text/content underneath. Multiple wipes in sequence. Sharp geometric. Gold/black luxury feel.',
+          bg: '#0a0a0a',
+        },
+        {
+          name: 'Orbit System',
+          desc: 'Central element with items orbiting around it using CSS transforms and rotation. Solar system metaphor. Central topic with related concepts orbiting. Dotted orbit paths. Space/tech feel.',
+          bg: '#050515',
+        },
+        {
+          name: 'Watercolor Splash',
+          desc: 'Soft pastel colored blobs (large border-radius divs with gradients and opacity 0.3-0.5) that spread outward. Clean text on top. Artistic, creative feel. Warm pastels: peach, lavender, mint. Light theme.',
+          bg: '#faf5f0',
+        },
+      ];
+
+      // Shuffle styles so each batch gets random variety
+      if (i === 0) {
+        // Fisher-Yates shuffle on first iteration
+        for (let si = VISUAL_STYLES.length - 1; si > 0; si--) {
+          const sj = Math.floor(Math.random() * (si + 1));
+          [VISUAL_STYLES[si], VISUAL_STYLES[sj]] = [VISUAL_STYLES[sj], VISUAL_STYLES[si]];
+        }
+      }
+      // Use forced style if specified, otherwise use shuffled style
+      let styleForAnimation = VISUAL_STYLES[i % VISUAL_STYLES.length];
+      if (plan.forcedStyle) {
+        const forced = VISUAL_STYLES.find(s => s.name.toLowerCase() === plan.forcedStyle.toLowerCase());
+        if (forced) styleForAnimation = forced;
+      }
+
+      // Generate HTML animation with Gemini (for FrameForge rendering)
       const sceneResult = await ai.models.generateContent({
         model: 'gemini-2.5-flash',
         contents: [{
           role: 'user',
           parts: [{
-            text: `Create a Remotion animation for this video moment.
+            text: `Create a self-contained HTML animation for a video overlay. This will be rendered to MP4 by FrameForge.
 
 ANIMATION TYPE: ${plan.type}
 TITLE: ${plan.title}
 DESCRIPTION: ${plan.description}
 CONTEXT: ${plan.relevantContent}
-DURATION: ${plan.duration} seconds (${plan.duration * fps} frames)
+DURATION: ${plan.duration} seconds
+SIZE: ${width}x${height}
 
-Generate a scene-based animation. Return ONLY valid JSON:
-{
-  "scenes": [
-    {
-      "id": "scene-1",
-      "type": "title" | "bullets" | "stats" | "quote" | "callToAction" | "transition",
-      "duration": <frames>,
-      "content": {
-        "title": "optional title text",
-        "subtitle": "optional subtitle",
-        "items": [{"label": "item text", "icon": "optional emoji"}],
-        "stats": [{"value": "100%", "label": "stat name"}],
-        "quote": "quote text",
-        "author": "quote author",
-        "buttonText": "CTA text",
-        "backgroundColor": "#hex",
-        "textColor": "#hex",
-        "accentColor": "#hex"
-      }
-    }
-  ],
-  "totalDuration": <total frames>,
-  "backgroundColor": "#1a1a2e"
-}
+VISUAL STYLE: ${styleForAnimation.name}
+${styleForAnimation.desc}
 
-Make it visually engaging with good color choices. Use 2-4 scenes for variety.`
+Write a COMPLETE HTML file with embedded CSS and JavaScript.
+
+CRITICAL REQUIREMENTS:
+- Background: ${styleForAnimation.bg} (this exact color)
+- Import Google Font Inter: @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap')
+- Set html,body to exactly ${width}px x ${height}px, overflow:hidden
+- ALL animation via requestAnimationFrame + performance.now() (no CSS animation keyframes - they won't work in this renderer)
+- Use helper functions: lerp(a,b,t), ease(t)=1-Math.pow(1-t,3), clamp(t,start,end)
+- Text must be LARGE: 48-96px for headings, 24-36px for body
+- Stagger element animations with 0.2-0.4s delays between them
+- Keep animating for the full ${plan.duration} seconds (add subtle pulsing/floating after initial reveal)
+
+ANIMATION PHASES:
+Phase 1 (0-0.5s): Background elements appear, accent lines sweep in
+Phase 2 (0.5-2s): Main content animates in with ${styleForAnimation.name} style
+Phase 3 (2s-end): Subtle continued motion - floating, pulsing, color shifts
+
+DO NOT use CSS @keyframes or CSS animation property. ONLY use JavaScript requestAnimationFrame.
+DO NOT use any external libraries. Pure vanilla JS and CSS.
+
+Return ONLY the raw HTML. No markdown fences. Start with <!DOCTYPE html>.`
           }]
         }],
       });
 
-      let sceneData;
+      let htmlContent;
+      const durationInSeconds = plan.duration;
       try {
-        const sceneText = sceneResult.candidates[0].content.parts[0].text;
-        const cleanedScene = sceneText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-        sceneData = JSON.parse(cleanedScene);
+        htmlContent = sceneResult.candidates[0].content.parts[0].text;
+        // Strip markdown fences if present
+        htmlContent = htmlContent.replace(/```html\n?/g, '').replace(/```\n?/g, '').trim();
+        if (!htmlContent.startsWith('<!DOCTYPE') && !htmlContent.startsWith('<html')) {
+          // Try to find HTML in response
+          const htmlMatch = htmlContent.match(/<!DOCTYPE[\s\S]*<\/html>/i) || htmlContent.match(/<html[\s\S]*<\/html>/i);
+          if (htmlMatch) htmlContent = htmlMatch[0];
+        }
       } catch (parseError) {
-        console.error(`[${jobId}] Failed to parse scene data for animation ${i + 1}, using fallback`);
-        // Create a simple fallback animation
-        sceneData = {
-          scenes: [{
-            id: 'scene-1',
-            type: 'title',
-            duration: plan.duration * fps,
-            content: {
-              title: plan.title,
-              subtitle: plan.description.substring(0, 50),
-              backgroundColor: '#1a1a2e',
-              textColor: '#ffffff',
-              accentColor: '#6366f1'
-            }
-          }],
-          totalDuration: plan.duration * fps,
-          backgroundColor: '#1a1a2e'
-        };
+        console.error(`[${jobId}] Failed to get HTML for animation ${i + 1}, using fallback`);
+        htmlContent = `<!DOCTYPE html><html><head>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:${width}px;height:${height}px;overflow:hidden;background:#0a0a0a;display:flex;align-items:center;justify-content:center;font-family:'Inter',sans-serif}
+.title{font-size:64px;font-weight:900;color:#fff;opacity:0;transform:translateY(30px)}
+.sub{font-size:28px;color:#888;opacity:0;margin-top:12px}
+.bar{width:0;height:4px;background:linear-gradient(90deg,#6366f1,#f97316);margin-top:20px;border-radius:2px}
+.wrap{text-align:center}
+</style></head><body><div class="wrap">
+<div class="title" id="t">${plan.title}</div>
+<div class="bar" id="b"></div>
+<div class="sub" id="s">${plan.description.substring(0, 60)}</div>
+</div><script>
+function e(t){return 1-Math.pow(1-t,3)}
+function c(t,a,b){return Math.max(0,Math.min(1,(t-a)/(b-a)))}
+function u(){var t=performance.now()/1000;
+var tp=e(c(t,0.3,1));document.getElementById('t').style.opacity=tp;document.getElementById('t').style.transform='translateY('+(30*(1-tp))+'px)';
+document.getElementById('b').style.width=(e(c(t,1,2))*300)+'px';
+var sp=e(c(t,1.5,2.2));document.getElementById('s').style.opacity=sp;
+requestAnimationFrame(u)}requestAnimationFrame(u);
+</script></body></html>`;
       }
 
-      // Save scene data
+      // Save HTML and scene data
+      const htmlPath = join(session.dir, `${assetId}.html`);
+      writeFileSync(htmlPath, htmlContent);
+      const sceneData = { html: true, title: plan.title, type: plan.type, description: plan.description };
       writeFileSync(sceneDataPath, JSON.stringify(sceneData, null, 2));
-      writeFileSync(propsPath, JSON.stringify(sceneData, null, 2));
 
-      const totalDuration = sceneData.totalDuration || sceneData.scenes.reduce((sum, s) => sum + s.duration, 0);
-      const durationInSeconds = totalDuration / fps;
-
-      // Render with Remotion
-      const remotionArgs = [
-        'remotion', 'render',
-        'src/remotion/index.tsx',
-        'DynamicAnimation',
-        outputPath,
-        '--props', propsPath,
-        '--frames', `0-${totalDuration - 1}`,
-        '--fps', String(fps),
-        '--width', String(width),
-        '--height', String(height),
-        '--codec', 'h264',
-        '--overwrite',
-        '--gl=angle', // Use Metal GPU acceleration on macOS
+      // Render with FrameForge
+      // Check multiple locations for FrameForge CLI
+      const frameforgeLocations = [
+        join(process.env.USERPROFILE || process.env.HOME || '', '.openclaw', 'workspace', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
+        join(process.cwd(), '..', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
+        join(process.cwd(), '..', '..', 'frameforge', 'packages', 'core', 'dist', 'cli.js'),
       ];
+      const frameforgeCliPath = frameforgeLocations.find(p => existsSync(p)) || frameforgeLocations[0];
+      const useFrameForge = existsSync(frameforgeCliPath);
 
-      await new Promise((resolve, reject) => {
-        const proc = spawn(NPX_CMD, remotionArgs, {
-          cwd: process.cwd(),
-          stdio: ['pipe', 'pipe', 'pipe'],
-          shell: process.platform === 'win32',
-        });
+      if (useFrameForge) {
+        console.log(`[${jobId}] Rendering with FrameForge...`);
+        await new Promise((resolve, reject) => {
+          const proc = spawn('node', [
+            frameforgeCliPath, 'render', htmlPath,
+            '--output', outputPath,
+            '--duration', String(Math.ceil(durationInSeconds)),
+            '--width', String(width),
+            '--height', String(height),
+          ], {
+            cwd: process.cwd(),
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env, GEMINI_API_KEY: apiKey },
+          });
 
-        let stderr = '';
-        proc.stderr.on('data', (data) => {
-          stderr += data.toString();
+          let stderr = '';
+          proc.stderr.on('data', (data) => { stderr += data.toString(); });
+          proc.on('close', (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(`FrameForge render failed: ${stderr.substring(0, 200)}`));
+          });
+          proc.on('error', (err) => reject(new Error(`Failed to start FrameForge: ${err.message}`)));
         });
+      } else {
+        // Fallback to Remotion if FrameForge not available
+        console.log(`[${jobId}] FrameForge not found, falling back to Remotion...`);
+        writeFileSync(propsPath, JSON.stringify({
+          scenes: [{ id: 'scene-1', type: 'title', duration: durationInSeconds * fps,
+            content: { title: plan.title, subtitle: plan.description.substring(0, 50),
+              backgroundColor: '#1a1a2e', textColor: '#ffffff', accentColor: '#6366f1' }
+          }],
+          totalDuration: durationInSeconds * fps, backgroundColor: '#1a1a2e'
+        }, null, 2));
 
-        proc.on('close', (code) => {
-          if (code === 0) {
-            resolve();
-          } else {
-            reject(new Error(`Remotion render failed: ${stderr.substring(0, 200)}`));
-          }
+        const remotionArgs = [
+          'remotion', 'render', 'src/remotion/index.tsx', 'DynamicAnimation', outputPath,
+          '--props', propsPath, '--frames', `0-${Math.round(durationInSeconds * fps) - 1}`,
+          '--fps', String(fps), '--width', String(width), '--height', String(height),
+          '--codec', 'h264', '--overwrite', '--gl=angle',
+        ];
+        await new Promise((resolve, reject) => {
+          const proc = spawn(NPX_CMD, remotionArgs, { cwd: process.cwd(), stdio: ['pipe', 'pipe', 'pipe'], shell: process.platform === 'win32' });
+          let stderr = '';
+          proc.stderr.on('data', (data) => { stderr += data.toString(); });
+          proc.on('close', (code) => { code === 0 ? resolve() : reject(new Error(`Remotion failed: ${stderr.substring(0, 200)}`)); });
+          proc.on('error', (err) => reject(new Error(`Failed to start Remotion: ${err.message}`)));
         });
+      }
 
-        proc.on('error', (err) => {
-          reject(new Error(`Failed to start Remotion: ${err.message}`));
-        });
-      });
+      // Clean up HTML file
+      try { unlinkSync(htmlPath); } catch (e) {}
 
       // Generate thumbnail
       try {
@@ -11837,6 +12556,8 @@ const server = http.createServer(async (req, res) => {
     await handleRemoveDeadAir(req, res);
   } else if (req.method === 'POST' && path === '/generate-chapters') {
     await handleGenerateChapters(req, res);
+  } else if (req.method === 'POST' && path === '/auto-enhance') {
+    await handleAutoEnhance(req, res);
   } else if (req.method === 'GET' && path === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', ffmpeg: 'native', sessions: sessions.size }));
@@ -11855,6 +12576,7 @@ server.listen(PORT, () => {
   console.log(`   POST /session/:id/process - Apply FFmpeg edit`);
   console.log(`   POST /session/:id/remove-dead-air - Remove silence`);
   console.log(`   POST /session/:id/chapters - Generate chapters`);
+  console.log(`   POST /auto-enhance - FrameForge transcript intelligence`);
   console.log(`   GET  /session/:id/download - Download final video`);
   console.log(`   DELETE /session/:id - Clean up session`);
   console.log(`\n   Multi-Asset API:`);

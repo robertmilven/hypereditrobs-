@@ -2564,10 +2564,76 @@ export default function Home() {
                 {isGeneratingChapters ? 'Generating...' : 'Chapters'}
               </button>
               {clips.length > 0 && (
-                <ExportPresetsDropdown
-                  onExport={handleExport}
-                  disabled={isProcessing}
-                />
+                <>
+                  <ExportPresetsDropdown
+                    onExport={handleExport}
+                    disabled={isProcessing}
+                  />
+                  <button
+                    onClick={() => {
+                      const platformOptions = [
+                        {id: 'twitter', label: 'Twitter @HoldingsPpr'},
+                        {id: 'tiktok', label: 'TikTok @delightfuljanice'},
+                        {id: 'facebook', label: 'Facebook AI Injection'},
+                        {id: 'youtube_daily', label: 'YouTube DailyDiscovery'},
+                        {id: 'youtube_pixel', label: 'YouTube Pixel Perfect'},
+                      ];
+                      const selection = prompt(
+                        'Select platforms (enter numbers separated by commas):\n\n' +
+                        platformOptions.map((p, i) => `${i+1}. ${p.label}`).join('\n') +
+                        '\n\nExample: 1,2,3 for Twitter+TikTok+Facebook\nOr press Enter for all:',
+                        ''
+                      );
+                      if (selection === null) return;
+
+                      let selectedPlatforms;
+                      if (selection.trim() === '') {
+                        selectedPlatforms = platformOptions.map(p => p.id);
+                      } else {
+                        const indices = selection.split(',').map(s => parseInt(s.trim()) - 1);
+                        selectedPlatforms = indices.filter(i => i >= 0 && i < platformOptions.length).map(i => platformOptions[i].id);
+                      }
+
+                      if (selectedPlatforms.length === 0) { alert('No platforms selected'); return; }
+
+                      const captionChoice = prompt(
+                        `Caption for ${selectedPlatforms.length} platform(s):\n\n` +
+                        '1. Write your own\n' +
+                        '2. AI auto-generate with hashtags\n\n' +
+                        'Enter 1 or 2:',
+                        '2'
+                      );
+                      if (captionChoice === null) return;
+
+                      let caption = '';
+                      if (captionChoice === '2') {
+                        // AI auto-generate caption
+                        caption = '[AI_GENERATE]';
+                        alert('AI will generate captions with hashtags for each platform. Publishing...');
+                      } else {
+                        caption = prompt('Type your caption:', '') || '';
+                        if (!caption) return;
+                      }
+
+                      const names = selectedPlatforms.map(id => platformOptions.find(p => p.id === id)?.label).join(', ');
+
+                      fetch(`http://localhost:3333/session/${session?.sessionId}/publish`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({caption, platforms: selectedPlatforms, youtubeTitle: caption?.substring(0, 60)}),
+                      })
+                        .then(r => r.json())
+                        .then(d => alert(d.message || d.error || 'Published!'))
+                        .catch(e => alert('Publish failed: ' + e.message));
+                    }}
+                    disabled={isProcessing}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-green-600 hover:bg-green-500 text-white rounded-md transition-colors disabled:opacity-50"
+                    title="Publish to social media"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+                    Publish
+                  </button>
+                </>
               )}
             </>
           )}
@@ -2580,15 +2646,60 @@ export default function Home() {
               else if (toolId === 'viral') setShowViralPanel(true);
               else if (toolId === 'repurpose') setShowRepurposePanel(true);
               else if (toolId === 'remotion') setShowRemotionPanel(true);
+              else if (toolId === 'stockfootage') {
+                const query = prompt('Search stock footage:', 'AI technology');
+                if (query && session?.sessionId) {
+                  fetch(`http://localhost:3333/session/${session.sessionId}/stock-search`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({query, type: 'image', count: 5, source: 'pexels'}),
+                  }).then(r => r.json()).then(d => {
+                    alert(`Found ${d.count || 0} images for "${query}". They're in your asset library.`);
+                    refreshAssets?.();
+                  }).catch(e => alert('Stock search failed: ' + e.message));
+                }
+              }
+              else if (toolId === 'reaction') {
+                const mainId = prompt('Main video asset ID (drag from library to see ID):');
+                const overlayId = prompt('Overlay video asset ID:');
+                const layout = prompt('Layout (pip, side-by-side, top-bottom):', 'pip');
+                if (mainId && overlayId && session?.sessionId) {
+                  fetch(`http://localhost:3333/session/${session.sessionId}/reaction-video`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({mainAssetId: mainId, overlayAssetId: overlayId, layout: layout || 'pip'}),
+                  }).then(r => r.json()).then(d => {
+                    alert(d.message || d.error || 'Reaction video created!');
+                    refreshAssets?.();
+                  }).catch(e => alert('Reaction video failed: ' + e.message));
+                }
+              }
+              else if (toolId === 'templates') {
+                if (!session?.sessionId) { alert('Upload a video first'); return; }
+                const templates = ['NewsClip', 'FaceOverlay', 'SplitScreen', 'HookTextVideo', 'ProductDemo', 'TestimonialReview', 'QuoteCard', 'SkoolPromoCustom'];
+                const choice = prompt(`Choose template:\n${templates.map((t,i) => `${i+1}. ${t}`).join('\n')}\n\nEnter number:`, '1');
+                if (choice) {
+                  const template = templates[parseInt(choice) - 1];
+                  if (!template) { alert('Invalid choice'); return; }
+                  const headline = prompt(`Headline for ${template}:`, 'Your headline here');
+                  if (headline) {
+                    fetch(`http://localhost:3333/session/${session.sessionId}/remotion-import`, {
+                      method: 'POST', headers: {'Content-Type': 'application/json'},
+                      body: JSON.stringify({compositionId: template, props: {headline, hook: headline, hookText: headline, quote: headline, points: ['Point 1', 'Point 2', 'Point 3'], cta: 'Follow for more'}, voiceoverText: headline}),
+                    }).then(r => r.json()).then(d => {
+                      alert(d.message || d.error || 'Template imported!');
+                      refreshAssets?.();
+                    }).catch(e => alert('Template import failed: ' + e.message));
+                  }
+                }
+              }
               else if (toolId === 'shortcuts') setShowKeyboardShortcuts(true);
             }}
             activePanel={
-              showScenePanel ? 'scene' :
-              showBrollPanel ? 'broll' :
-              showThumbnailPanel ? 'thumbnail' :
-              showViralPanel ? 'viral' :
-              showRepurposePanel ? 'repurpose' :
-              showRemotionPanel ? 'remotion' :
+              showScenePanel ? 'scene' as const :
+              showBrollPanel ? 'broll' as const :
+              showThumbnailPanel ? 'thumbnail' as const :
+              showViralPanel ? 'viral' as const :
+              showRepurposePanel ? 'repurpose' as const :
+              showRemotionPanel ? 'remotion' as const :
               null
             }
           />
@@ -3036,7 +3147,7 @@ export default function Home() {
             const captionClips = clips.filter(c => c.trackId === 'T1');
             captionClips.forEach(clip => {
               updateCaptionStyle(clip.id, {
-                animation: style.animation as 'none' | 'pop' | 'bounce' | 'karaoke',
+                animation: style.animation as CaptionStyle['animation'],
                 highlightColor: style.highlightColor,
               });
             });

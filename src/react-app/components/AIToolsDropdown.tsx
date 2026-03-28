@@ -9,9 +9,12 @@ import {
   Code,
   HelpCircle,
   ChevronDown,
+  Film,
+  Search,
+  Layout,
 } from 'lucide-react';
 
-type ToolId = 'scene' | 'broll' | 'thumbnail' | 'viral' | 'repurpose' | 'remotion' | 'shortcuts';
+type ToolId = 'scene' | 'broll' | 'thumbnail' | 'viral' | 'repurpose' | 'remotion' | 'shortcuts' | 'stockfootage' | 'reaction' | 'templates';
 
 interface AIToolsDropdownProps {
   onSelect: (toolId: ToolId) => void;
@@ -34,6 +37,9 @@ const AI_TOOLS: Array<{
   { id: 'repurpose', icon: Scissors, label: 'Content Repurpose', description: 'Long to shorts', color: 'text-purple-400', group: 'analyze' },
   // Create Group
   { id: 'remotion', icon: Code, label: 'Remotion Generator', description: 'Custom animations', color: 'text-cyan-400', group: 'create' },
+  { id: 'stockfootage', icon: Search, label: 'Stock Footage', description: 'Search Pexels & Pixabay', color: 'text-emerald-400', group: 'create' },
+  { id: 'reaction', icon: Layout, label: 'Reaction Video', description: 'PiP, side-by-side, split', color: 'text-rose-400', group: 'create' },
+  { id: 'templates', icon: Film, label: 'Video Templates', description: '8 Remotion templates', color: 'text-amber-400', group: 'create' },
   // Help Group
   { id: 'shortcuts', icon: HelpCircle, label: 'Keyboard Shortcuts', description: 'View all shortcuts', color: 'text-zinc-400', group: 'help' },
 ];

@@ -26,6 +26,9 @@ const ANIMATION_OPTIONS = [
   { value: 'fade', label: 'Fade In' },
   { value: 'pop', label: 'Pop' },
   { value: 'bounce', label: 'Bounce' },
+  { value: 'highlight', label: 'Highlight Box' },
+  { value: 'bold-center', label: 'Bold Center' },
+  { value: 'minimal', label: 'Minimal' },
 ];
 
 const POSITION_OPTIONS = [
@@ -327,8 +330,8 @@ export default function CaptionPropertiesPanel({
           </select>
         </div>
 
-        {/* Highlight Color (for karaoke) */}
-        {style.animation === 'karaoke' && (
+        {/* Highlight Color (for karaoke, highlight, bold-center, pop, bounce) */}
+        {['karaoke', 'highlight', 'bold-center', 'pop', 'bounce'].includes(style.animation) && (
           <div>
             <label className="text-xs font-medium text-zinc-300 block mb-2">Highlight Color</label>
             <input
